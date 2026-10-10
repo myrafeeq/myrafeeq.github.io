@@ -1054,7 +1054,7 @@ function draftCard(d, n, active) {
     d.due ? `<span class="chip sm">${sic('cal', 13)}${wd(d.due)} ${fmtShort(d.due)}${isWeekend(d.due) ? ` <em class="wk">${t('weekend')}</em>` : ''}</span>` : d.noDue ? `<span class="chip sm">${t('noDue')}</span>` : `<span class="chip sm missing">${sic('cal', 13)}${t('noDueYet')}</span>`,
     d.time ? `<span class="chip sm">${sic('clock', 13)}<span class="num">${fmtTime(d.time)}</span></span>` : '',
     d.recur ? `<span class="chip sm">${sic('repeat', 13)}${recurLabel(d.recur)}</span>` : '',
-    d.priority === 'hi' ? `<span class="chip sm hi">${t('prioHi')}</span>` : '',
+    d.priority === 'hi' ? `<span class="chip sm hi">${t('prioHi')}</span>` : d.priority === 'lo' ? `<span class="chip sm">${t('prioLo')}</span>` : '',
     `<span class="chip sm">${roleTxt}</span>`,
     d.source === SELF && !askSource() ? '' : d.source ? `<span class="chip sm">${t('srcShort')}: ${esc(srcLabel(d.source))}</span>` : `<span class="chip sm missing">${t('srcShort')}: ${L() === 'ar' ? '؟' : '?'}</span>`,
     ...ppl.map(p => `<span class="chip sm ${p.ref.kind === 'generic' || p.ref.kind === 'amb' ? 'missing' : ''}">${sic(p.role === 'waiting' ? 'clock' : 'users', 13)}<span dir="auto">${esc(refName(p.ref))}</span>${p.ref.kind === 'new' && p.ref.desc ? `<small dir="auto">· ${esc(p.ref.desc)}</small>` : ''}${p.ref.kind === 'new' ? ` <em>${t('newBadge')}</em>` : ''}</span>`),
@@ -1076,7 +1076,7 @@ function questionHTML({ n, d, m }) {
   else if (m.k === 'due') { q = t('askDueQ', { t: ttl }); opts = dateChips().map(([l, v]) => `<button type="button" class="chip" data-act="ansdue" data-v="${v}">${l}</button>`).join('') + `<label class="chip datein">${sic('cal', 15)}<input type="date" id="ansDate" aria-label="${esc(t('pickDate'))}"></label><button type="button" class="chip" data-act="ansdue" data-v="">${t('noDue')}</button>`; }
   else if (m.k === 'weekend') { const nx = addWorkdays(d.due, 1), pv = addWorkdays(d.due, -1); q = t('askWeekend', { d: `${wd(d.due)} ${fmtShort(d.due)}` }); opts = (pv >= T() ? `<button type="button" class="chip" data-act="answk" data-v="${pv}">${t('moveTo', { d: `${wd(pv)} ${fmtShort(pv)}` })}</button>` : '') + `<button type="button" class="chip" data-act="answk" data-v="${nx}">${t('moveTo', { d: `${wd(nx)} ${fmtShort(nx)}` })}</button><button type="button" class="chip" data-act="answk" data-v="keep">${t('keepIt')}</button>`; }
   else if (m.k === 'source') { q = t('askSource', { t: ttl }); const srcs = [...new Set([...recentSources(), ...topPeople(4).map(p => p.name)])].slice(0, 6); const left = CH.drafts.filter(x => !isLogD(x) && !x.source).length; const all = left > 1 ? [...new Set([CH.lastSrc, SELF].filter(Boolean))].map(v => `<button type="button" class="chip primary-chip" data-act="anssrc" data-all="1" data-v="${esc(v)}" dir="auto">${esc(t('srcForAll', { s: srcLabel(v), n: left }))}</button>`).join('') : ''; opts = all + `<button type="button" class="chip on" data-act="anssrc" data-v="${SELF}">${t('srcSelf')}</button>` + srcs.map(s => `<button type="button" class="chip" data-act="anssrc" data-v="${esc(s)}" dir="auto">${esc(s)}</button>`).join(''); }
-  else if (m.k === 'who') { q = t('askWho', { t: ttl }); opts = topPeople(8).map(p => `<button type="button" class="chip ${CH.pick.has(p.id) ? 'on' : ''}" data-act="answho" data-v="${p.id}" dir="auto">${esc(p.name)}</button>`).join('') + `<button type="button" class="chip primary-chip" data-act="answhodone" ${CH.pick.size ? '' : 'disabled'}>${sic('check', 14)}${t('done')}</button>`; }
+  else if (m.k === 'who') { q = t('askWho', { t: ttl }); opts = d.people.map((p, i) => p.role === 'related' ? `<button type="button" class="chip" data-act="answhorel" data-i="${i}" dir="auto">${esc(refName(p.ref))}</button>` : '').join('') + topPeople(8).filter(p => !d.people.some(q => q.ref.kind === 'known' && q.ref.id === p.id)).map(p => `<button type="button" class="chip ${CH.pick.has(p.id) ? 'on' : ''}" data-act="answho" data-v="${p.id}" dir="auto">${esc(p.name)}</button>`).join('') + `<button type="button" class="chip primary-chip" data-act="answhodone" ${CH.pick.size ? '' : 'disabled'}>${sic('check', 14)}${t('done')}</button>`; }
   else if (m.k === 'generic' || m.k === 'amb') { const p = d.people[m.i]; q = m.k === 'generic' ? t('askGeneric', { r: esc(p.ref.label) }) : t('whoExactly', { n: esc(p.ref.label) }); const ids = m.k === 'amb' ? p.ref.ids : topPeople(8).map(x => x.id); opts = ids.map(id => `<button type="button" class="chip" data-act="ansref" data-i="${m.i}" data-v="${id}" dir="auto">${esc(pname(id))}</button>`).join('') + (m.k === 'generic' ? `<button type="button" class="chip" data-act="ansref" data-i="${m.i}" data-v="keep">${t('keepAs', { r: esc(p.ref.label) })}</button>` : ''); }
   return `<div class="ask q"><p>${lead}${q}</p><div class="opts">${opts}</div>${m.k === 'match' ? '' : `<small class="note">${t(m.k === 'who' ? 'orTypeNames' : m.k === 'source' ? 'orTypeName' : m.k === 'due' ? 'orTypeDate' : 'orType')}</small>`}</div>`;
 }
@@ -1228,9 +1228,10 @@ function answerText({ d, m }, text) {
     d.source = srcName(text); CH.lastSrc = d.source; return true;
   }
   if (m.k === 'who') {
-    if (text.split(/\s+/).length > 8) return false;
+    if (text.split(/\s+/).length > 8 || EDIT_CUE.test(n)) return false; // «خلي السابعة تنفيذ شخصي» is an edit, not a name
+    if (text.split(/[،,+؛;]|\s+و\s*/).some(x => x.trim().split(/\s+/).length > 3)) return false;
     const names = text.split(/[،,+؛;]|\s+و\s*/).map(s => s.trim()).filter(Boolean);
-    names.forEach(nm => { const ref = refOf(nm); if (ref && !d.people.some(p => refName(p.ref) === refName(ref))) d.people.push({ ref, role: 'followup', what: '', due: null }); });
+    names.forEach(nm => { const ref = refOf(nm); if (!ref) return; const ex = d.people.find(p => refName(p.ref) === refName(ref)); if (ex) { if (ex.role === 'related') ex.role = 'followup'; } else d.people.push({ ref, role: 'followup', what: '', due: null }); }); // a name already on the task (as «related») becomes the one followed up
     return names.length > 0;
   }
   if (m.k === 'generic' || m.k === 'amb') {
@@ -1311,7 +1312,7 @@ function queryHTML(q) {
   const list = (title, rows, empty) => `<div class="qhead">${title}</div>${rows.length ? `<div class="qlist">${rows.join('')}</div>` : `<div class="muted">${empty}</div>`}`;
   const rangeLabel = (a, b) => a === b ? (a === T() ? t('today') : a === addDays(T(), 1) ? t('tomorrow') : `${wd(a)} ${fmtShort(a)}`) : `${fmtShort(a)} – ${fmtShort(b)}`;
   switch (q.type) {
-    case 'late': { const ts = sortTasks(open.filter(isLate)); const fs = fus.filter(([, f]) => fuLate(f)); return list(t('qaLate', { n: plural(ts.length, 'tasks'), m: plural(fs.length, 'fus') }), [...ts.map(qRow), ...fs.map(([x, f]) => qFu(x, f))], t('qaNothingLate')); }
+    case 'late': { const ts = sortTasks(open.filter(isLate)); const fs = fus.filter(([, f]) => fuLate(f)); return list(ts.length && fs.length ? t('qaLate', { n: plural(ts.length, 'tasks'), m: plural(fs.length, 'fus') }) : t('qaLate1', { n: plural(ts.length || fs.length, ts.length ? 'tasks' : 'fus') }), [...ts.map(qRow), ...fs.map(([x, f]) => qFu(x, f))], t('qaNothingLate')); }
     case 'waiting': { const ts = sortTasks(open.filter(x => x.status === 'wait')); return list(t('qaWaiting', { n: ts.length }), ts.map(qRow), t('qaNone')); }
     case 'nodue': { const ts = sortTasks(open.filter(x => !x.due)); return list(t('qaNoDue', { n: ts.length }), ts.map(qRow), t('qaNone')); }
     case 'followups': {
@@ -2054,7 +2055,8 @@ document.addEventListener('click', async e => {
       case 'answk': { const pp = pending(); if (pp) { if (el.dataset.v === 'keep') pp.d.weekendOk = true; else pp.d.due = el.dataset.v; } return renderChat(); }
       case 'anssrc': { const pp = pending(), v = el.dataset.v; if (el.dataset.all) CH.drafts.forEach(x => { if (!isLogD(x) && !x.source) x.source = v; }); else if (pp) pp.d.source = v; CH.lastSrc = v; return renderChat(); }
       case 'answho': { const v = el.dataset.v; if (CH.pick.has(v)) CH.pick.delete(v); else CH.pick.add(v); return renderChat(false); }
-      case 'answhodone': { const pp = pending(); if (pp) CH.pick.forEach(pid => { if (!pp.d.people.some(p => p.ref.kind === 'known' && p.ref.id === pid)) pp.d.people.push({ ref: { kind: 'known', id: pid }, role: 'followup', what: '', due: null }); }); CH.pick = new Set(); return renderChat(); }
+      case 'answhodone': { const pp = pending(); if (pp) CH.pick.forEach(pid => { const ex = pp.d.people.find(p => p.ref.kind === 'known' && p.ref.id === pid); if (ex) { if (ex.role === 'related') ex.role = 'followup'; } else pp.d.people.push({ ref: { kind: 'known', id: pid }, role: 'followup', what: '', due: null }); }); CH.pick = new Set(); return renderChat(); }
+      case 'answhorel': { const pp = pending(); const pr = pp && pp.d.people[+el.dataset.i]; if (pr) pr.role = 'followup'; return renderChat(); }
       case 'ansref': { const pp = pending(); if (pp && pp.d.people[+el.dataset.i]) { const pr = pp.d.people[+el.dataset.i]; pr.ref = el.dataset.v === 'keep' ? { kind: 'new', name: pr.ref.label, desc: '' } : { kind: 'known', id: el.dataset.v }; } return renderChat(); }
       case 'remind': return x && f && openRemind(x, f);
       case 'remwa': { const msg = $('#remTxt')?.value || ''; const ph = el.dataset.phone; window.open(`https://wa.me/${ph || ''}?text=${encodeURIComponent(msg)}`, '_blank', 'noopener'); if (x && f) logReminder(x, f); closeSheet(true); return toast(t('reminderLogged')); }

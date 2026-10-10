@@ -268,17 +268,18 @@ export function saveProfile(patch, { quiet = false } = {}) {
   Object.assign(state.profile, patch); saveLocal(); if (!quiet) emit('profile');
   if (state.mode === 'cloud') { lsSet('rafeeq2.profileDirty.' + state.user.id, true); pushProfile(); }
 }
-let profilePushing = false;
+let profilePushing = false, profileAgain = false;
 async function pushProfile() {
-  if (!sb || state.mode !== 'cloud' || !navigator.onLine || profilePushing) return;
-  profilePushing = true;
+  if (!sb || state.mode !== 'cloud' || !navigator.onLine) return;
+  if (profilePushing) { profileAgain = true; return; } // a change made while saving is sent right after, never dropped
+  profilePushing = true; profileAgain = false;
   try {
     // settings are merged key by key with the server copy, so a device that changed the weekend does not erase the Drive folders another device created
     const { data: srv } = await sb.from('profiles').select('settings').eq('id', state.user.id).maybeSingle();
     const merged = Object.assign({}, srv?.settings || {}, state.profile.settings || {});
     const { error } = await sb.from('profiles').upsert({ id: state.user.id, ...state.profile, settings: merged });
-    if (!error) { state.profile.settings = merged; lsDel('rafeeq2.profileDirty.' + state.user.id); }
-  } catch (e) { console.warn('profile', e); } finally { profilePushing = false; }
+    if (!error) { state.profile.settings = Object.assign({}, srv?.settings || {}, state.profile.settings || {}); if (!profileAgain) lsDel('rafeeq2.profileDirty.' + state.user.id); } // keep what changed meanwhile
+  } catch (e) { console.warn('profile', e); } finally { profilePushing = false; if (profileAgain) pushProfile(); }
 }
 
 /* ---------- mutations ---------- */
