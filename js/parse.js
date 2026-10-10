@@ -88,12 +88,23 @@ function dayOfMonth(td, dom, mon = null, year = null) {
   }
   return null;
 }
+/** «في ديسمبر», «خلال نوفمبر», «شهر 12»: a month with no day → its last workday (this year, or next if already past). */
+export function monthOnly(n, td = today()) {
+  n = ' ' + normAr(n) + ' ';
+  if (MONTH_RE.test(n)) return null;
+  const m = n.match(new RegExp('(?:في|خلال|اول|قبل نهايه|نهايه|اخر)\\s+(?:شهر\\s+)?(' + MONTHS.flat().join('|') + ')(?![\\p{L}])', 'u')) || n.match(/(?:في|خلال)\s+شهر\s+(\d{1,2})(?!\d)/);
+  if (!m) return null;
+  const mon = /^\d+$/.test(m[1]) ? +m[1] - 1 : MONTHS.findIndex(a => a.includes(m[1])); if (mon < 0 || mon > 11) return null;
+  const y0 = +td.slice(0, 4); let v = lastWorkdayOf(y0, mon); if (v < td) v = lastWorkdayOf(y0 + 1, mon);
+  return /اول/.test(m[0]) ? (() => { let d = ds(new Date(+v.slice(0, 4), mon, 1)); while (isWeekend(d)) d = addDays(d, 1); return d < td ? null : d; })() : v;
+}
 function dueFrom(n, td) {
   // explicit dates first: «29 أكتوبر», «الأحد 18», «يوم 15» — a weekday name next to a number is just a label
   let mm = n.match(MONTH_RE);
   if (mm) { const mon = MONTHS.findIndex(a => a.includes(mm[2])); const v = dayOfMonth(td, +mm[1], mon, mm[3] ? +mm[3] : null); if (v) return v; }
   mm = n.match(/(?:^|[^\p{L}])(?:يوم\s+)?(?:ال)?(?:احد|اثنين|اتنين|ثلاثاء|تلات|اربعاء|اربع|خميس|جمعه|سبت)\s+(\d{1,2})(?![\d\/\-:])/u) || n.match(/(?:^|[^\p{L}])(?:يوم|بتاريخ)\s+(\d{1,2})(?![\d\/\-:]|\s*(?:يوم|ايام|ساع|دقيق))/u);
   if (mm && +mm[1] >= 1 && +mm[1] <= 31) { const v = dayOfMonth(td, +mm[1]); if (v) return v; }
+  const mo = monthOnly(n, td); if (mo) return mo;
   if (RE_AFTER_TOMORROW.test(n)) return addDays(td, 2);
   if (RE_TODAY.test(n)) return td;
   if (RE_TOMORROW.test(n)) return addDays(td, 1);
@@ -124,7 +135,7 @@ const VERBS = [
   [/^(أتابع|اتابع|تابع|نتابع)\s+(مع\s+)?/, 'متابعة '], [/^(أراجع|اراجع)\s+/, 'مراجعة '], [/^(أجهز|اجهز|أجهّز|أحضّر|احضر)\s+/, 'تجهيز '],
   [/^(أبعت|ابعت|أرسل|ارسل)\s+/, 'إرسال '], [/^(أسأل|اسأل|اسال)\s+/, 'سؤال '], [/^(أرفع|ارفع)\s+/, 'رفع '], [/^(أعمل|اعمل|أسوي|اسوي)\s+/, 'إعداد '],
   [/^(أزور|ازور)\s+/, 'زيارة '], [/^(أطلب|اطلب)\s+/, 'طلب '], [/^(أدقق|ادقق)\s+/, 'تدقيق '], [/^(أفحص|افحص)\s+/, 'فحص '], [/^(أسلم|اسلم|أسلّم)\s+/, 'تسليم '],
-  [/^(أحدث|احدث|أحدّث)\s+/, 'تحديث '], [/^(أكتب|اكتب)\s+/, 'كتابة '], [/^(أحضر|احضر)\s+(اجتماع|الاجتماع)/, 'حضور $2'], [/^(أطبع|اطبع)\s+/, 'طباعة '],
+  [/^(أحدث|احدث|أحدّث)\s+/, 'تحديث '], [/^(أكتب|اكتب)\s+/, 'كتابة '], [/^(أحضر|احضر)\s+(اجتماع|الاجتماع)/, 'حضور $2'], [/^(أطبع|اطبع)\s+/, 'طباعة '], [/^(أرتب|ارتب|رتب|رتّب)\s+/, 'ترتيب '], [/^(أبدأ|ابدأ|ابدا|أبدا)\s+/, 'بدء '], [/^(أنظم|انظم|نظم|نظّم)\s+/, 'تنظيم '],
 ];
 const DATE_WORDS = '(?:الأسبوع ده|الاسبوع ده|الأسبوع دا|الاسبوع دا|هذا الأسبوع|هذا الاسبوع|الأسبوع هذا|الاسبوع هذا|الأسبوع الحالي|الاسبوع الحالي|الأسبوع الجاية|الاسبوع الجاية|الأسبوع اللي جاي|الاسبوع اللي جاي|this week|النهارده|النهاردة|اليوم|بكرة|بكره|بكرا|غدًا|غدا|بعد بكرة|بعد بكره|بعد غد|الأحد|الاحد|الاثنين|الإثنين|الاتنين|الثلاثاء|التلات|الأربعاء|الاربعاء|الخميس|الجمعة|السبت|الأسبوع الجاي|الاسبوع الجاي|الأسبوع القادم|آخر الشهر|اخر الشهر|آخر الأسبوع|اخر الاسبوع|بعد أسبوع|بعد اسبوع|بعد يومين|today|tomorrow|next week)';
 const MONTH_WORDS = '(?:\\d{1,2}\\s*(?:من\\s+)?(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يونيه|يوليو|يوليه|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)(?:\\s+\\d{4})?)';
@@ -256,6 +267,7 @@ export function parseCapture(text, people, td = today()) {
   if (rc?.span) base = base.replace(rc.span, ' ');
   base = base.replace(/\s*(?:من نفسي|مبادرة مني|مبادره مني|تكليف ذاتي)\s*/g, ' ').trim();
   base = base.replace(NODUE_RE, ' ').trim();
+  base = base.replace(/\s*(?:في|خلال|أول|اول)\s+(?:شهر\s+)?(?:يناير|فبراير|مارس|أبريل|ابريل|مايو|يونيو|يونيه|يوليو|يوليه|أغسطس|اغسطس|سبتمبر|أكتوبر|اكتوبر|نوفمبر|ديسمبر)(?![\p{L}])/gu, ' ').trim();
   let s = base.replace(FILLER, '');
   s = /^(?:مستني|مستنى|منتظر|بانتظار|في انتظار)\s+/.test(s) ? s.replace(/^(?:مستني|مستنى|منتظر|بانتظار|في انتظار)\s+/, 'انتظار ') : s.replace(/\s*(?:و\s*)?(?:مستني|منتظر|بانتظار|في انتظار)\s+.*$/, '');
   if (deleg) { // «كلّف سامي يجهز العينات» → «تجهيز العينات», followed up with سامي
@@ -274,7 +286,7 @@ export function parseCapture(text, people, td = today()) {
   { const nm = person && (person.kind === 'known' ? (people.find(x => x.id === person.id) || {}).name : person.kind === 'new' ? person.name : '');
     const m = nm && s.match(new RegExp('^متابعة\\s+' + escapeRe(nm) + '\\s+(?:في|بخصوص|على)?\\s*(.{3,})$'));
     if (m) s = 'متابعة ' + m[1] + ' مع ' + nm; } // «تابع مع محمد اعتماد العرض» → «متابعة اعتماد العرض مع محمد»
-  s = clean(s.replace(/\s+و$/, ''));
+  s = clean(s.replace(/\s+و$/, '').replace(/\s+(?:آخر|اخر|نهاية|نهايه|في|خلال)$/, ''));
   if (!s) s = raw;
 
   // What we need from the person
@@ -396,7 +408,7 @@ export function recurFrom(raw, base = today()) {
   m = t.match(/(?:في\s+)?(?:آخر|اخر|نهاية|نهايه)\s+(?:يوم\s+)?(?:في\s+|من\s+)?كل\s+شهر|كل\s+(?:آخر|اخر)\s+(?:يوم\s+(?:في\s+|من\s+)?(?:ال)?)?شهر|end of every month|last (?:work)?day of (?:every|each) month/i);
   if (m) return { recur: { f: 'monthly', dom: 'last' }, span: m[0] };
   m = t.match(/كل\s+(?:3|تلات|ثلاث|ثلاثة|تلاتة|تلاته|ثلاثه)\s+(?:شهور|أشهر|اشهر)|ربع\s+سنوي(?:ًا|ا)?|كل\s+ربع(?:\s+سن[ةه])?|quarterly|every quarter/i);
-  if (m) { const d = t.match(/يوم\s+(\d{1,2})(?!\d)/); return { recur: { f: 'quarterly', dom: d ? Math.min(31, +d[1]) : pd(base).getDate() }, span: m[0] }; }
+  if (m) { const d = t.match(/يوم\s+(\d{1,2})(?!\d)/), last = /(?:آخر|اخر|نهاية|نهايه)\s+(?:كل\s+)?(?:ربع|3|تلات|ثلاث)|(?:ربع|شهور|أشهر|اشهر)\s+(?:في\s+)?(?:آخره|اخره|آخرها|اخرها)|end of (?:every |each )?quarter/i.test(t); return { recur: { f: 'quarterly', dom: last ? 'last' : d ? Math.min(31, +d[1]) : pd(base).getDate() }, span: m[0] }; }
   m = t.match(/كل\s+شهر\s+(?:يوم|في)?\s*(\d{1,2})(?!\d)|(?:يوم|في)\s+(\d{1,2})\s+(?:من\s+)?كل\s+شهر|every month on (?:the )?(\d{1,2})|كل\s+يوم\s+(\d{1,2})(?!\d)/i);
   if (m) return { recur: { f: 'monthly', dom: Math.max(1, Math.min(31, +(m[1] || m[2] || m[3] || m[4]))) }, span: m[0] };
   m = t.match(/كل\s+شهر|شهري(?:ًا|ا|اً)|monthly|every month/i);
@@ -418,6 +430,7 @@ export function recurNext(r, from) {
     const days = Array.isArray(r.days) && r.days.length ? r.days : [pd(from).getDay()];
     let d = addDays(from, 1); for (let i = 0; i < 7; i++) { if (days.includes(pd(d).getDay())) return shiftWork(d); d = addDays(d, 1); } return null;
   }
+  if (r.f === 'quarterly' && r.dom === 'last') { const f0 = pd(from); for (let k = 0; k <= 15; k++) { const mm = f0.getMonth() + k; if (((mm % 12) + 12) % 12 % 3 !== 2) continue; const c = lastWorkdayOf(f0.getFullYear() + Math.floor(mm / 12), ((mm % 12) + 12) % 12); if (c > from) return c; } return null; } // «آخر كل ربع» = the calendar quarter ends
   const step = r.f === 'quarterly' ? 3 : 1, f = pd(from), dom = r.dom ?? f.getDate();
   let y = f.getFullYear(), m = f.getMonth();
   if (monthDay(y, m - 1, dom) === from) m -= 1; // `from` is last month's occurrence moved past a weekend: anchor there, not on the shifted month

@@ -2,7 +2,7 @@
 import { state, onChange, boot, enterLocal, signInGoogle, signOut, cloudReady, putTask, putPerson, putFile, newTask, newPerson, newFile, saveProfile, syncNow, uuid, nowISO, bulkReplace, localLeftovers, adoptLocalLeftovers, authError, connectDrive, unlinkDrive, refreshDriveStatus, invokeRefine, invokeAssist, sb, pushSupported, pushCurrent, pushEnable, pushDisable, pushTest } from './data.js';
 import { reportHTML, ensureReportCSS, monthName } from './report.js';
 import { uploadFile, trashFile, renameFile, fileBlob, viewUrl, previewUrl, rootFolderUrl, kindOf, extLabel, fmtSize, MAX_BYTES } from './drive.js';
-import { parseCapture, timeFrom, splitTasks, isLogText, splitLogs, logDate, recurNext, cleanRecur, setWeekend, weekendDays, weekStartDay, today, addDays, diffDays, pd, ds, nextWeekday, addWorkdays, isWeekend, validDate, findPeople, nameTokens, normAr, lastOfMonth } from './parse.js';
+import { monthOnly, parseCapture, timeFrom, splitTasks, isLogText, splitLogs, logDate, recurNext, cleanRecur, setWeekend, weekendDays, weekStartDay, today, addDays, diffDays, pd, ds, nextWeekday, addWorkdays, isWeekend, validDate, findPeople, nameTokens, normAr, lastOfMonth } from './parse.js';
 import { DICT } from './i18n.js';
 import { xlsxBlob } from './xlsx.js';
 
@@ -955,6 +955,8 @@ function fromAI(a, local, raw = '', many = false) {
   const ln = normAr(raw || local?.raw || '');
   if (a.priority === 'hi' && !URG_RE.test(ln) && !(ALL_RE.test(whole) && URG_RE.test(whole))) a = { ...a, priority: local?.priority === 'hi' ? 'hi' : 'mid' }; // no stated urgency → never «عالية»
   if (NEXTWK_RE.test(ln) && !DAYNAME_RE.test(ln.replace(NEXTWK_RE, ''))) a = { ...a, due: nextWeekday(T(), weekStartDay()) }; // «الأسبوع الجاي» alone = its first workday
+  if (!validDate(a.due) && !a.no_due) { const mo = monthOnly(ln, T()); if (mo) a = { ...a, due: mo }; } // «في ديسمبر» → its last workday
+  if (validDate(a.due) && isWeekend(a.due) && /(^|\s)قبل\s/.test(ln)) { let x = a.due; while (isWeekend(x)) x = addDays(x, -1); a = { ...a, due: x }; } // «قبل 15 نوفمبر» on a weekend → the last workday before it
   if (WAIT_RE.test(ln) && !FOLLOW_VERB_RE.test(ln) && Array.isArray(a.people)) a = { ...a, role: a.role === 'both' ? 'follow' : a.role, waiting_what: a.waiting_what || 'reply', people: a.people.map(p => p && p.role === 'followup' ? { ...p, role: 'waiting' } : p) }; // «مستني رد X» = waiting, not a follow-up
   const d = { id: uuid(), raw: local?.raw || '', title: String(a.title || local?.title || '').replace(/\s+/g, ' ').trim().slice(0, 300), due: validDate(a.due) || local?.due || null, weekendOk: false,
     priority: ['hi', 'mid', 'lo'].includes(a.priority) ? a.priority : local?.priority || 'mid', role: ['exec', 'follow', 'both'].includes(a.role) ? a.role : 'exec',
@@ -963,6 +965,7 @@ function fromAI(a, local, raw = '', many = false) {
     project: String(a.project || '').slice(0, 80), waitWhat: a.waiting_what || null, people: [],
     time: /^\d{2}:\d{2}$/.test(a.due_time || '') ? a.due_time : local?.time || null, recur: cleanRecur(a.recur) || local?.recur || null };
   if (d.recur && (!d.due || d.recur.dom === 'last' || isWeekend(d.due))) d.due = recurNext(d.recur, addDays(T(), -1)); // «آخر كل شهر» = last workday
+  if (d.recur?.f === 'daily' && d.due > T() && !isWeekend(T()) && !/(بكره|بكرا|بكرة|غدا|من بكره)/.test(ln)) { const nowHM = new Date().toTimeString().slice(0, 5); if (!d.time || d.time > nowHM) d.due = T(); } // «كل يوم» starts today when today is still ahead
   (a.people || []).slice(0, 8).forEach(p => {
     if (!p || !p.name) return;
     const ref = refOf(p.name, p.desc, !!p.generic); if (!ref) return;
