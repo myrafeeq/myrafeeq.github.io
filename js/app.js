@@ -1,10 +1,11 @@
 // رفيق — application UI (mobile-first, RTL/LTR, light by default)
-import { state, onChange, boot, enterLocal, signInGoogle, signOut, cloudReady, putTask, putPerson, putFile, newTask, newPerson, newFile, saveProfile, syncNow, uuid, nowISO, bulkReplace, localLeftovers, adoptLocalLeftovers, authError, connectDrive, unlinkDrive, refreshDriveStatus, invokeRefine, invokeAssist, sb, pushSupported, pushCurrent, pushEnable, pushDisable, pushTest } from './data.js';
+import { state, onChange, boot, enterLocal, signInGoogle, signOut, cloudReady, putTask, putPerson, putFile, putUnit, newTask, newPerson, newFile, newUnit, saveProfile, syncNow, uuid, nowISO, bulkReplace, localLeftovers, adoptLocalLeftovers, authError, connectDrive, unlinkDrive, refreshDriveStatus, invokeRefine, invokeAssist, sb, pushSupported, pushCurrent, pushEnable, pushDisable, pushTest } from './data.js';
 import { reportHTML, ensureReportCSS, monthName } from './report.js';
 import { uploadFile, trashFile, renameFile, fileBlob, viewUrl, previewUrl, rootFolderUrl, kindOf, extLabel, fmtSize, MAX_BYTES } from './drive.js';
 import { monthOnly, parseCapture, timeFrom, splitTasks, isLogText, splitLogs, logDate, recurNext, cleanRecur, setWeekend, weekendDays, weekStartDay, today, addDays, diffDays, pd, ds, nextWeekday, addWorkdays, isWeekend, validDate, findPeople, nameTokens, normAr, lastOfMonth } from './parse.js';
 import { DICT } from './i18n.js';
 import { xlsxBlob } from './xlsx.js';
+import { readSheet, serialDate } from './xlsxread.js';
 
 /* ================= i18n & formatting ================= */
 const L = () => state.profile.lang === 'en' ? 'en' : 'ar';
@@ -59,6 +60,7 @@ const ic = {
   minus: I('<path d="M5 12h14"/>', 'stroke-width="2.4"'),
   note: I('<path d="M5 4h14v16H5z"/><path d="M8 9h8M8 13h8M8 17h5"/>'),
   spark: I('<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/>'),
+  org: I('<rect x="9" y="3" width="6" height="5" rx="1.2"/><rect x="3" y="16" width="6" height="5" rx="1.2"/><rect x="15" y="16" width="6" height="5" rx="1.2"/><path d="M12 8v4M6 16v-2h12v2"/>'),
   folder: I('<path d="M3 7a2 2 0 0 1 2-2h4l2 2.5h8a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   table: I('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M3 15h18M9 4v16"/>'),
   clip: I('<path d="M20 11.5l-8.2 8.2a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/>'),
@@ -84,11 +86,40 @@ const files = () => state.files.filter(f => !f.deleted).sort((a, b) => (b.create
 const fileById = id => state.files.find(f => f.id === id);
 const filesOfTask = id => files().filter(f => f.task_id === id);
 const filesOfPerson = id => files().filter(f => f.person_id === id);
+/* departments (kind 'dept') and their sections (kind 'sec', parent_id = the department) */
+const orgOn = () => !(state.mode === 'cloud' && state.schemaOld); // the cloud database must be updated (009_org.sql) first
+let unitsMemo = { rev: -1, list: [] };
+const units = () => { if (unitsMemo.rev !== state.rev) unitsMemo = { rev: state.rev, list: (state.units || []).filter(u => !u.deleted).sort((a, b) => (a.sort || 0) - (b.sort || 0) || COLL.compare(a.name, b.name)) }; return unitsMemo.list; };
+const depts = () => units().filter(u => u.kind === 'dept');
+const secsOf = id => units().filter(u => u.kind === 'sec' && u.parent_id === id);
+const unitById = id => id ? (state.units || []).find(u => u.id === id && !u.deleted) || null : null;
+const deptOf = id => { const u = unitById(id); return !u ? null : u.kind === 'dept' ? u : unitById(u.parent_id); };
+const unitLabel = (id, short) => { const u = unitById(id); if (!u) return ''; if (u.kind === 'dept') return u.name; const d = unitById(u.parent_id); return d && !short ? `${d.name} › ${u.name}` : u.name; };
+const unitOf = x => orgOn() ? unitById(x?.unit_id) : null;
+/** A department/section named in free text: exact names first, then a close one («التميز» → «إدارة التميز المؤسسي»). Returns its id or null. */
+const UNIT_STOP = /^(اداره|ادارة|قسم|قطاع|مكتب|وحده|وحدة|ال)$/;
+function matchUnit(text, strict) {
+  if (/[›>]/.test(String(text || ''))) { const [a, b] = String(text).split(/[›>]/).map(x => x.trim()); const d = deptOf(matchUnit(a)); if (!d) return null; const sc = secsOf(d.id).find(x => normAr(x.name) === normAr(b)) || secsOf(d.id).find(x => normAr(x.name).includes(normAr(b)) || normAr(b).includes(normAr(x.name))); return sc ? sc.id : d.id; } // «الإدارة › القسم» as the app writes it
+  const n = ' ' + normAr(String(text || '')).replace(/[«»"'().,،؛:?؟!]/g, ' ').replace(/\s+/g, ' ').trim() + ' '; if (n.trim().length < 2) return null;
+  const list = units();
+  const rx = s => new RegExp('\\s(?:[وفبل]|ال|لل)?' + s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s');
+  const core = nm => normAr(nm).replace(/^(اداره|قسم|قطاع|وحده|مكتب)\s+/, '');
+  const whole = list.filter(u => rx(normAr(u.name)).test(n) || (core(u.name) !== normAr(u.name) && core(u.name).split(' ').length >= 1 && new RegExp('(اداره|قسم|قطاع|وحده|مكتب)\\s+(?:ال)?' + core(u.name).replace(/^ال/, '(?:ال)?') + '\\s').test(n))).sort((a, b) => b.name.length - a.name.length)[0];
+  if (whole) return whole.id;
+  if (strict) return null; // inside a task's own words only a named department counts («تقرير الأداء» is not «قسم قياس الأداء»)
+  const sig = s => normAr(s).split(/\s+/).map(w => w.replace(/^ال/, '')).filter(w => w.length > 2 && !UNIT_STOP.test(w));
+  const words = new Set(sig(n)); let best = null, bs = 0;
+  list.forEach(u => { const ws = sig(u.name); if (!ws.length) return; const hit = ws.filter(w => words.has(w)).length; const sc = hit / ws.length + (u.kind === 'sec' ? 0.01 : 0); if (hit && sc > bs) { bs = sc; best = u.id; } });
+  return bs >= 0.5 ? best : null;
+}
+/** The unit a person belongs to (set once on the person). */
+const unitOfPerson = pid => { const p = personById(pid); return p && unitById(p.unit_id) ? p.unit_id : null; };
 const localDay = iso => ds(new Date(iso || Date.now()));
 const initials = n => { const s = String(n || '').replace(/^(?:م|د|أ|ا|Eng|Dr|Mr|Mrs|Ms)\.?\s+/i, '').replace(/^ال(?=\S{2,})/, '').trim(); const m = s.match(/[\p{L}\p{N}]/u); return m ? m[0].toUpperCase() : '?'; };
-const isOpen = x => ['todo', 'prog', 'wait', 'hold'].includes(x.status);
+const isOpen = x => ['todo', 'prog', 'wait', 'review', 'hold'].includes(x.status);
+const isWaitLike = x => x.status === 'wait' || x.status === 'review'; // waiting on someone else: a reply, or a review/approval of finished work
 const isLog = x => x.kind === 'log';
-const isLate = x => isOpen(x) && x.due && x.due < T();
+const isLate = x => isOpen(x) && x.status !== 'review' && x.due && x.due < T(); // under review = the user's part is done
 const openFus = x => (x.followups || []).filter(f => f.status === 'open');
 const fuLate = f => f.status === 'open' && f.due && f.due < T();
 function addLog(x, kind, text = '', data = {}) { x.log = x.log || []; x.log.push({ id: uuid(), at: nowISO(), kind, text, data }); }
@@ -246,8 +277,18 @@ function go(tab) { UI.tab = tab; closeAllLayers(); renderNav(); renderMain(); wi
 /* ================= components ================= */
 function statusPill(x) {
   if (isLog(x)) return `<span class="pill log">${sic('check', 12)}${t('logPill')}</span>`;
-  const m = { todo: ['', 'stTodo'], prog: ['prog', 'stProg'], wait: ['wait', 'stWait'], hold: ['', 'stHold'], done: ['done', 'stDone'], cancelled: ['', 'stCancelled'] }[x.status] || ['', 'stTodo'];
+  const m = { todo: ['', 'stTodo'], prog: ['prog', 'stProg'], wait: ['wait', 'stWait'], review: ['review', 'stReview'], hold: ['', 'stHold'], done: ['done', 'stDone'], cancelled: ['', 'stCancelled'] }[x.status] || ['', 'stTodo'];
   return `<span class="pill ${m[0]}">${x.status === 'wait' ? sic('clock', 13) : ''}${t(m[1])}</span>`;
+}
+/** The status on a card, tappable: one tap opens the status choices. */
+function statusBtn(x) {
+  const m = { prog: 'prog', wait: 'wait', review: 'review' }[x.status] || '';
+  return `<button type="button" class="pill stbtn ${m}" data-act="stmenu" data-id="${x.id}" aria-label="${esc(t('changeStatusOf', { s: t(stKey(x.status)) }))}">${x.status === 'wait' ? sic('clock', 12) : ''}${t(stKey(x.status))}<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>`;
+}
+function openStatusMenu(x) {
+  openSheet(t('changeStatus'), `<p class="note" dir="auto" style="margin-top:0">«${esc(x.title.slice(0, 80))}»</p>
+    <div class="st-pick">${OPEN_ST().map(s => `<button type="button" class="st-opt ${x.status === s ? 'on' : ''}" data-act="stpick" data-id="${x.id}" data-v="${s}"><span class="pill ${{ prog: 'prog', wait: 'wait', review: 'review' }[s] || ''}">${t(stKey(s))}</span><small>${t('stHint_' + s)}</small></button>`).join('')}
+      <button type="button" class="st-opt" data-act="stpick" data-id="${x.id}" data-v="done"><span class="pill done">${sic('check', 12)}${t('stDone')}</span><small>${t('stHint_done')}</small></button></div>`);
 }
 function duePill(x) {
   if (!x.due) return isOpen(x) ? '' : '';
@@ -257,7 +298,7 @@ function duePill(x) {
 }
 function taskCard(x, opts = {}) {
   const nf = openFus(x).sort((a, b) => (a.due || '9') < (b.due || '9') ? -1 : 1)[0];
-  const stripe = isLate(x) ? 'late' : x.status === 'wait' ? 'wait' : '';
+  const stripe = isLate(x) ? 'late' : isWaitLike(x) ? 'wait' : '';
   const done = !isOpen(x);
   // one line, two facts at most: when, and the single thing that matters most about it (details live in the task page)
   const when = done ? (x.completed_on ? `<span>${t('doneOn', { d: fmtShort(x.completed_on) })}</span>` : '')
@@ -266,7 +307,9 @@ function taskCard(x, opts = {}) {
     : x.priority === 'hi' && !done ? `<span class="pill hi">${t('prioHi')}</span>`
     : nf ? `<span>${sic('users', 13)} ${esc(pname(nf.person_id).split(' ').slice(0, 2).join(' '))}${openFus(x).length > 1 ? ` +${openFus(x).length - 1}` : ''}</span>`
     : x.project && !opts.noProject ? `<span class="projlink" data-proj="${esc(x.project)}" role="link" dir="auto">${esc(x.project)}</span>` : '';
-  const meta = [opts.status || isLog(x) || (!when && x.status === 'prog') ? statusPill(x) : '', when, key].filter(Boolean).join('');
+  const un = unitOf(x);
+  const stEl = isLog(x) ? statusPill(x) : isOpen(x) && !opts.noStatusBtn ? statusBtn(x) : opts.status ? statusPill(x) : '';
+  const meta = [stEl, when, key, un && !opts.noUnit ? `<span class="unit" dir="auto">${sic('org', 12)} ${esc(unitLabel(un.id, true))}</span>` : ''].filter(Boolean).join('');
   const card = `<div class="tcard ${done ? 'is-done' : ''} ${isLog(x) ? 'is-log' : ''}" data-open="${x.id}" role="button" tabindex="0">
       ${stripe ? `<span class="stripe ${stripe}"></span>` : ''}
       ${x.status === 'cancelled' ? '<span class="chk" aria-hidden="true"></span>' : `<button type="button" class="chk ${x.status === 'done' ? 'on' : ''}" ${isOpen(x) ? `data-act="quickdone" data-id="${x.id}" aria-label="${esc(t('complete'))}"` : 'tabindex="-1" aria-hidden="true"'}>${x.status === 'done' ? ic.check : ''}</button>`}
@@ -310,6 +353,16 @@ function mfCard(g) {
       ${phone ? `<div class="mf-acts"><a class="btn sm" href="tel:${esc(phone.replace(/[^\d+]/g, ''))}">${sic('phone', 15)}${t('call')}</a><a class="btn sm" href="https://wa.me/${esc(waNumber(phone))}" target="_blank" rel="noopener">${sic('send', 15)}WhatsApp</a></div>` : ''}
     </section>`;
 }
+/** Departments with open work, as filter chips with counts (late ones flagged). */
+function unitRow() {
+  if (!orgOn() || !depts().length) return '';
+  const open = live().filter(x => isOpen(x) && !x.archived);
+  const rows = depts().map(d => { const ids = new Set([d.id, ...secsOf(d.id).map(s => s.id)]); const ts = open.filter(x => ids.has(x.unit_id)); return { d, n: ts.length, late: ts.filter(isLate).length }; }).filter(r => r.n || UI.unitF === r.d.id);
+  const none = open.filter(x => !unitById(x.unit_id)).length;
+  if (!rows.length) return '';
+  return `<div class="people-row unit-row">${rows.map(r => `<button type="button" class="pchip uchip ${UI.unitF && deptOf(UI.unitF)?.id === r.d.id ? 'on' : ''}" data-unitf="${r.d.id}">${sic('org', 13)}<span class="nm" dir="auto">${esc(r.d.name)}</span><i class="num">${r.n}</i>${r.late ? `<i class="num late">${r.late} ${t('secLate')}</i>` : ''}</button>`).join('')}${none ? `<button type="button" class="pchip uchip ${UI.unitF === '-' ? 'on' : ''}" data-unitf="-"><span class="nm">${t('noUnit')}</span><i class="num">${none}</i></button>` : ''}</div>`;
+}
+const inUnit = (x, uid) => uid === '-' ? !unitById(x.unit_id) : !!uid && (x.unit_id === uid || unitById(x.unit_id)?.parent_id === uid);
 function tasksHead(mode) {
   const full = mode === 'list', tbl = mode === 'table';
   const pc = id => live().filter(x => isOpen(x) && (x.waiting_on === id || openFus(x).some(f => f.person_id === id))).length;
@@ -317,6 +370,7 @@ function tasksHead(mode) {
   const openN = live().filter(isOpen).length;
   return `<header class="hdr"><div class="grow"><h1>${t('navTasks')}</h1><div class="sub">${plural(openN, 'openTasks')}</div></div><button type="button" class="btn sm" data-tview="${tbl ? 'cards' : 'table'}" aria-pressed="${tbl}">${tbl ? sic('list', 16) : sic('table', 16)}<span class="lbl-sm">${t(tbl ? 'viewCards' : 'viewTable')}</span></button><button type="button" class="btn primary sm desk" data-act="chat">${ic.plus}${t('newTask')}</button><button type="button" class="iconbtn addman mob" data-act="chat" aria-label="${esc(t('newTask'))}">${ic.plus}</button>${meBtn()}</header>
       ${full ? `<label class="search">${ic.search}<input type="search" id="taskQ" value="${esc(UI.q)}" placeholder="${esc(t('searchTasks'))}" aria-label="${esc(t('searchTasks'))}" dir="auto"></label>` : ''}
+      ${full ? unitRow() : ''}
       ${full && ppl.length ? `<div class="people-row">${ppl.map(p => `<button type="button" class="pchip ${UI.personF === p.id ? 'on' : ''}" data-pf="${p.id}"><span class="av">${esc(initials(p.name))}</span><span class="nm" dir="auto">${esc(p.name.replace(/^(?:م|د|أ|ا)\.\s*/, '').split(' ')[0])}</span><i class="num">${pc(p.id)}</i></button>`).join('')}</div>` : ''}
       ${tbl ? '' : `<div class="seg four" role="tablist">${[['active', 'segActive'], ['wait', 'segWaitShort'], ['week', 'segWeek'], ['done', 'segDone']].map(([k, l]) => `<button type="button" role="tab" aria-selected="${UI.seg === k}" class="${UI.seg === k ? 'on' : ''}" data-seg="${k}">${t(l)}</button>`).join('')}</div>`}`;
 }
@@ -328,7 +382,8 @@ const TCOLS = [
   { k: 'title', h: 'fTitle', key: true, w: 42, get: x => x.title },
   { k: 'due', h: 'fDue', key: true, w: 12, date: true, get: x => x.due || '' },
   { k: 'time', h: 'fTime', w: 9, get: x => x.due_time || '' },
-  { k: 'status', h: 'fStatus', key: true, w: 14, get: x => t(stKey(x.status)) + (isLate(x) ? ` · ${t('secLate')}` : ''), sort: x => (isLate(x) ? 0 : 1) + ({ wait: 1, prog: 2, todo: 3, hold: 4, done: 5, cancelled: 6 }[x.status] || 9) / 10 },
+  { k: 'status', h: 'fStatus', key: true, w: 14, get: x => t(stKey(x.status)) + (isLate(x) ? ` · ${t('secLate')}` : ''), sort: x => (isLate(x) ? 0 : 1) + ({ wait: 1, review: 1.5, prog: 2, todo: 3, hold: 4, done: 5, cancelled: 6 }[x.status] || 9) / 10 },
+  { k: 'unit', h: 'fUnit', key: true, w: 22, get: x => orgOn() ? unitLabel(x.unit_id) : '', on: () => orgOn() && depts().length > 0 },
   { k: 'prio', h: 'fPriority', key: true, w: 11, get: x => PRIO_L(x.priority), sort: x => ({ hi: 0, mid: 1, lo: 2 }[x.priority] ?? 1) },
   { k: 'role', h: 'fRole', w: 13, get: x => t('role_' + (x.role || 'exec')) },
   { k: 'source', h: 'fSource', w: 16, get: x => srcLabel(x.source) },
@@ -338,13 +393,15 @@ const TCOLS = [
   { k: 'updated', h: 'tcUpdated', w: 12, date: true, get: lastTouch },
   { k: 'completed', h: 'tcCompleted', w: 12, date: true, get: x => x.completed_on || '' },
 ];
-const XCOLS = [...TCOLS, { k: 'result', h: 'result', w: 30, get: x => x.result || '' }, { k: 'details', h: 'fDetails', w: 34, get: x => x.details || '' }];
+const tcols = () => TCOLS.filter(c => !c.on || c.on());
+const XCOLS = () => [...tcols(), { k: 'result', h: 'result', w: 30, get: x => x.result || '' }, { k: 'details', h: 'fDetails', w: 34, get: x => x.details || '' }];
 function tableRows() {
   const f = UI.tf || {}, st = f.st || 'open';
   let list = live().filter(x => !x.archived && !isLog(x));
-  list = list.filter(x => st === 'all' ? true : st === 'open' ? isOpen(x) : st === 'late' ? isLate(x) : st === 'wait' ? isOpen(x) && x.status === 'wait' : !isOpen(x));
+  list = list.filter(x => st === 'all' ? true : st === 'open' ? isOpen(x) : st === 'late' ? isLate(x) : st === 'wait' ? isOpen(x) && isWaitLike(x) : !isOpen(x));
   if (f.person) list = list.filter(x => x.waiting_on === f.person || (x.followups || []).some(y => y.person_id === f.person));
   if (f.project) list = list.filter(x => projKey(x.project) === projKey(f.project));
+  if (f.unit && orgOn()) list = list.filter(x => inUnit(x, f.unit));
   if (f.from || f.to) list = list.filter(x => { const d = !isOpen(x) ? x.completed_on : x.due; return d && (!f.from || d >= f.from) && (!f.to || d <= f.to); });
   const col = TCOLS.find(c => c.k === (UI.tsort?.k || 'due')) || TCOLS[1], dir = UI.tsort?.d || 1;
   const val = x => col.sort ? col.sort(x) : (col.get(x) || (col.date ? '9999' : '\uffff'));
@@ -361,17 +418,18 @@ function tableView() {
       ${sel('tfSt', f.st || 'open', [['open', t('tfOpen')], ['late', t('secLate')], ['wait', t('segWaitShort')], ['done', t('segDone')], ['all', t('tfAll')]])}
       ${sel('tfPerson', f.person || '', [['', t('tfAnyPerson')], ...ppl.map(p => [p.id, p.name])])}
       ${sel('tfProject', f.project || '', [['', t('tfAnyProject')], ...projects.map(p => [p, p])])}
+      ${orgOn() && depts().length ? sel('tfUnit', f.unit || '', [['', t('tfAnyUnit')], ...depts().flatMap(d => [[d.id, d.name], ...secsOf(d.id).map(sc => [sc.id, '   ↳ ' + sc.name])]), ['-', t('noUnit')]]) : ''}
       <span class="tf-dates"><label class="tf-date"><span>${t('tfFrom')}</span><input type="date" id="tfFrom" value="${esc(f.from || '')}" aria-label="${t('tfFrom')}"></label><label class="tf-date"><span>${t('tfTo')}</span><input type="date" id="tfTo" value="${esc(f.to || '')}" aria-label="${t('tfTo')}"></label></span>
-      ${f.person || f.project || f.from || f.to || (f.st && f.st !== 'open') ? `<button type="button" class="linkbtn" data-act="tfreset">${t('tfReset')}</button>` : ''}
+      ${f.person || f.project || f.unit || f.from || f.to || (f.st && f.st !== 'open') ? `<button type="button" class="linkbtn" data-act="tfreset">${t('tfReset')}</button>` : ''}
     </div>
     <div class="tf-sum"><span>${plural(rows.length, 'tasks')}</span><span class="grow"></span><button type="button" class="btn sm mob" data-act="tcols">${t(all ? 'tcKeyCols' : 'tcAllCols')}</button><button type="button" class="btn sm primary" data-act="xlsx" ${rows.length ? '' : 'disabled'}>${sic('download', 16)}${t('exportXlsx')}</button></div>
-    ${rows.length ? `<div class="tbl-wrap ${all ? '' : 'compact'}"><table class="tbl"><thead><tr>${TCOLS.map(c => `<th class="${c.key ? '' : 'opt'} c-${c.k}"><button type="button" data-tsort="${c.k}" aria-sort="${sortK === c.k ? (sortD > 0 ? 'ascending' : 'descending') : 'none'}">${t(c.h)}${sortK === c.k ? `<i>${sortD > 0 ? '▲' : '▼'}</i>` : ''}</button></th>`).join('')}</tr></thead>
-      <tbody>${rows.map(x => `<tr data-open="${x.id}" class="${isLate(x) ? 'late' : ''} ${isOpen(x) ? '' : 'done'}" tabindex="0" role="button">${TCOLS.map(c => `<td class="${c.key ? '' : 'opt'} c-${c.k}">${cellOf(c, x)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+    ${rows.length ? `<div class="tbl-wrap ${all ? '' : 'compact'}"><table class="tbl"><thead><tr>${tcols().map(c => `<th class="${c.key ? '' : 'opt'} c-${c.k}"><button type="button" data-tsort="${c.k}" aria-sort="${sortK === c.k ? (sortD > 0 ? 'ascending' : 'descending') : 'none'}">${t(c.h)}${sortK === c.k ? `<i>${sortD > 0 ? '▲' : '▼'}</i>` : ''}</button></th>`).join('')}</tr></thead>
+      <tbody>${rows.map(x => `<tr data-open="${x.id}" class="${isLate(x) ? 'late' : ''} ${isOpen(x) ? '' : 'done'}" tabindex="0" role="button">${tcols().map(c => `<td class="${c.key ? '' : 'opt'} c-${c.k}">${cellOf(c, x)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
       : `<div class="empty small"><p>${t('noMatch')}</p></div>`}`;
 }
 function exportXlsx() {
   const rows = tableRows(); if (!rows.length) return;
-  const blob = xlsxBlob({ sheet: t('xlsxSheet'), rtl: L() === 'ar', columns: XCOLS.map(c => ({ title: t(c.h), width: c.w, type: c.date ? 'date' : 'text' })), rows: rows.map(x => XCOLS.map(c => c.k === 'time' ? (x.due_time ? fmtTime(x.due_time) : '') : c.get(x))) });
+  const blob = xlsxBlob({ sheet: t('xlsxSheet'), rtl: L() === 'ar', columns: XCOLS().map(c => ({ title: t(c.h), width: c.w, type: c.date ? 'date' : 'text' })), rows: rows.map(x => XCOLS().map(c => c.k === 'time' ? (x.due_time ? fmtTime(x.due_time) : '') : c.get(x))) });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `rafeeq-tasks-${T()}.xlsx`;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 4000);
   toast(t('xlsxDone', { n: plural(rows.length, 'tasks') }));
@@ -408,7 +466,7 @@ function projectItems(name) {
   const all = live().filter(x => !x.archived && projKey(x.project) === k);
   const open = sortTasks(all.filter(x => isOpen(x) && !isLog(x)));
   const done = all.filter(x => !isOpen(x) && (x.completed_on || '').startsWith(ym)).sort((a, b) => (b.completed_on || '') > (a.completed_on || '') ? 1 : -1);
-  return { all, open, late: open.filter(isLate), wait: open.filter(x => x.status === 'wait'), rest: open.filter(x => !isLate(x) && x.status !== 'wait'), done, ym };
+  return { all, open, late: open.filter(isLate), wait: open.filter(isWaitLike), rest: open.filter(x => !isLate(x) && !isWaitLike(x)), done, ym };
 }
 function openProject(name) {
   if (!name) return;
@@ -601,11 +659,11 @@ const VIEWS = {
     const td = T();
     const act = live().filter(isOpen).filter(x => !x.archived);
     const late = sortTasks(act.filter(isLate));
-    const dueToday = sortTasks(act.filter(x => x.due === td && x.status !== 'wait'));
+    const dueToday = sortTasks(act.filter(x => x.due === td && !isWaitLike(x)));
     const fus = []; act.forEach(x => openFus(x).forEach(f => { if (f.due && f.due <= td) fus.push([x, f]); }));
     fus.sort((a, b) => a[1].due < b[1].due ? -1 : 1);
-    const waiting = sortTasks(act.filter(x => x.status === 'wait' && !isLate(x)));
-    const soon = sortTasks(act.filter(x => x.due && x.due > td && x.due <= addDays(td, 7) && x.status !== 'wait'));
+    const waiting = sortTasks(act.filter(x => isWaitLike(x) && !isLate(x)));
+    const soon = sortTasks(act.filter(x => x.due && x.due > td && x.due <= addDays(td, 7) && !isWaitLike(x)));
     const nodue = sortTasks(act.filter(x => !x.due && x.status === 'prog'));
     const actionable = act.filter(x => x.status === 'todo' || x.status === 'prog');
     const pick = sortTasks(actionable.filter(isLate))[0] || sortTasks(actionable.filter(x => x.due === td))[0] || sortTasks(actionable.filter(x => x.priority === 'hi'))[0] || sortTasks(actionable.filter(x => x.status === 'prog'))[0] || sortTasks(actionable)[0];
@@ -635,18 +693,19 @@ const VIEWS = {
     if (UI.tview === 'table') return tasksHead('table') + tableView();
     if (UI.seg === 'week') return tasksHead('week') + weekHTML();
     let list = live();
-    if (UI.seg === 'active') list = list.filter(x => isOpen(x) && x.status !== 'wait' && !x.archived);
-    if (UI.seg === 'wait') list = list.filter(x => isOpen(x) && !x.archived && x.status === 'wait');
+    if (UI.seg === 'active') list = list.filter(x => isOpen(x) && !isWaitLike(x) && !x.archived);
+    if (UI.seg === 'wait') list = list.filter(x => isOpen(x) && !x.archived && isWaitLike(x));
     if (UI.seg === 'done') list = list.filter(x => !isOpen(x) && !x.archived);
     if (UI.seg === 'archived') list = list.filter(x => x.archived);
     if (UI.personF) list = list.filter(x => x.waiting_on === UI.personF || (x.followups || []).some(f => f.person_id === UI.personF));
+    if (UI.unitF && orgOn()) list = list.filter(x => inUnit(x, UI.unitF));
     if (UI.q.trim()) { const q = normAr(UI.q.trim()); list = list.filter(x => normAr([x.title, x.details, x.project, x.source, x.notes, x.result, ...(x.followups || []).map(f => f.what + ' ' + pname(f.person_id)), ...(x.log || []).map(l => l.text)].join(' ')).includes(q)); }
     list = UI.seg === 'done' ? list.sort((a, b) => (b.completed_on || '') > (a.completed_on || '') ? 1 : -1) : sortTasks(list);
     const shown = list.slice(0, UI.listMax || 80);
-    const listHTML = `${shown.length ? shown.map(x => taskCard(x, { status: UI.seg !== 'active' })).join('') : `<div class="empty small"><p>${UI.q.trim() || UI.personF ? t('noMatch') : t('noTasksHere')}</p></div>`}${list.length > shown.length ? `<button type="button" class="linkbtn center" data-act="morelist">${t('showMore', { n: list.length - shown.length })}</button>` : ''}`;
+    const listHTML = `${shown.length ? shown.map(x => taskCard(x, { status: UI.seg !== 'active' })).join('') : `<div class="empty small"><p>${UI.q.trim() || UI.personF || UI.unitF ? t('noMatch') : t('noTasksHere')}</p></div>`}${list.length > shown.length ? `<button type="button" class="linkbtn center" data-act="morelist">${t('showMore', { n: list.length - shown.length })}</button>` : ''}`;
     if (UI.listOnly) return listHTML;
     return tasksHead('list') + `
-      ${UI.personF ? `<div class="chips filter"><button type="button" class="chip on" data-pf="${UI.personF}" dir="auto">${esc(pname(UI.personF))} ${sic('x', 14)}</button></div>` : ''}
+      ${UI.personF || (UI.unitF && orgOn()) ? `<div class="chips filter">${UI.personF ? `<button type="button" class="chip on" data-pf="${UI.personF}" dir="auto">${esc(pname(UI.personF))} ${sic('x', 14)}</button>` : ''}${UI.unitF && orgOn() ? `<button type="button" class="chip on" data-unitf="${UI.unitF}" dir="auto">${sic('org', 13)} ${esc(UI.unitF === '-' ? t('noUnit') : unitLabel(UI.unitF))} ${sic('x', 14)}</button>` : ''}${UI.unitF && UI.unitF !== '-' && secsOf(deptOf(UI.unitF)?.id).length ? secsOf(deptOf(UI.unitF).id).map(sc => `<button type="button" class="chip ${UI.unitF === sc.id ? 'on' : ''}" data-unitf="${UI.unitF === sc.id ? deptOf(sc.id).id : sc.id}" data-sec="1" dir="auto">${esc(sc.name)}</button>`).join('') : ''}</div>` : ''}
       <div class="stack" id="taskList">${listHTML}</div>
       ${UI.seg === 'done' || UI.seg === 'archived' ? `<button type="button" class="linkbtn center" data-seg="${UI.seg === 'archived' ? 'done' : 'archived'}">${UI.seg === 'archived' ? t('backToDone') : t('showArchived')}</button>` : ''}`;
   },
@@ -701,7 +760,9 @@ const VIEWS = {
       <div class="menu">
         <button type="button" data-act="lang"><span class="mi">${ic.globe}</span><span class="grow">${t('language')}<small>${L() === 'ar' ? 'العربية' : 'English'}</small></span><span class="val">${L() === 'ar' ? 'English' : 'العربية'}</span></button>
         <button type="button" data-act="theme"><span class="mi">${ic.moon}</span><span class="grow">${t('appearance')}<small>${(p.settings || {}).theme === 'dark' ? t('themeDark') : t('themeLight')}</small></span></button>
+        ${orgOn() ? `<button type="button" data-act="org"><span class="mi">${ic.org}</span><span class="grow">${t('orgTitle')}<small>${depts().length ? t('orgCount', { d: depts().length, s: units().filter(u => u.kind === 'sec').length }) : t('orgEmptyHint')}</small></span></button>` : (state.mode === 'cloud' ? `<button type="button" data-act="orgold"><span class="mi">${ic.org}</span><span class="grow">${t('orgTitle')}<small class="warn-txt">${t('orgNeedsDb')}</small></span></button>` : '')}
         <button type="button" data-act="weekend"><span class="mi">${ic.cal}</span><span class="grow">${t('wkTitle')}<small>${wkLabel()}</small></span></button>
+        <button type="button" data-act="askmore"><span class="mi">${ic.spark}</span><span class="grow">${t('askMoreSetting')}<small>${t(askMore() ? 'askMoreOn' : 'askMoreOff')}</small></span><span class="switch ${askMore() ? 'on' : ''}" aria-hidden="true"></span></button>
         <button type="button" data-act="asksrc"><span class="mi">${ic.users}</span><span class="grow">${t('askSrcSetting')}<small>${t(askSource() ? 'askSrcOn' : 'askSrcOff')}</small></span><span class="switch ${askSource() ? 'on' : ''}" aria-hidden="true"></span></button>
         <button type="button" data-act="tour"><span class="mi">${ic.info}</span><span class="grow">${t('tourAgain')}<small>${t('tourAgainHint')}</small></span></button>
       </div>
@@ -821,10 +882,12 @@ function logText(e) {
     case 'fu_reminded': return t('logReminded', { p: esc(pname(d.person_id)) });
     case 'ai': return t('logAI');
     case 'ai_undo': return t('logAIUndo');
+    case 'imported': return t('logImported');
     default: return '';
   }
 }
-const stKey = s => ({ todo: 'stTodo', prog: 'stProg', wait: 'stWait', hold: 'stHold', done: 'stDone', cancelled: 'stCancelled' }[s] || 'stTodo');
+const stKey = s => ({ todo: 'stTodo', prog: 'stProg', wait: 'stWait', review: 'stReview', hold: 'stHold', done: 'stDone', cancelled: 'stCancelled' }[s] || 'stTodo');
+const OPEN_ST = () => ['todo', 'prog', 'wait', ...(orgOn() ? ['review'] : []), 'hold'];
 
 /* ================= sheets ================= */
 let sheetState = null;
@@ -857,6 +920,7 @@ function confirmSheet(msg, okLabel, onOk, danger = true) {
 /* ================= assistant chat: capture (one or many tasks) + questions ================= */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition || null;
 const SELF = '@self';
+const askMore = () => (state.profile.settings || {}).askMore !== false; // 2.7.9: after the required answers the chat also asks the useful ones (priority, department) — each can be skipped
 const askSource = () => (state.profile.settings || {}).askSource !== false; // on by default (2.7.2): the chat asks «who assigned this?» unless the user turned it off
 const srcLabel = s => !s ? '' : s === SELF ? t('srcSelf') : s;
 const aiOn = () => state.mode === 'cloud' && (state.profile.settings || {}).ai !== false;
@@ -916,10 +980,12 @@ function fromLocal(p, raw) {
     add(r, role0, p.fu?.what || '', p.fu?.due || null);
     (p.more || []).forEach(m => add(m.kind === 'new' ? { kind: 'new', name: m.name, desc: '' } : m, role0 === 'waiting' ? 'followup' : role0, p.fu?.what || '', p.fu?.due || null));
   }
+  if (d.priority !== 'mid') d.prioAsked = true;
   if (p.deleg) d.role = 'follow';
   else if (p.fu) d.role = /^(متابعة|التواصل|سؤال)/.test(p.title) ? 'follow' : 'both';
   else if (p.waiting) d.role = 'follow';
   if (p.source) d.source = p.source.self ? SELF : (personById(matchPerson(p.source.name))?.name || p.source.name);
+  if (orgOn() && depts().length) { const u = matchUnit(raw, true); if (u) { d.unit = u; d.unitAsked = true; } else unitFromPeople(d); }
   return d;
 }
 /** An assigner's name as stored: a known person wins, even behind a role word («المدير عدنان الصلاح» → «عدنان الصلاح»). */
@@ -974,6 +1040,8 @@ function fromAI(a, local, raw = '', many = false) {
   });
   if (!Array.isArray(a.people) && local?.people?.length) d.people = local.people.filter(p => !(d.source && normAr(refName(p.ref)).includes(normAr(d.source).replace(/^(م|د|ا)\.\s*/, '').split(' ')[0])));
   if (d.people.some(p => p.role === 'followup') && d.role === 'exec') d.role = 'both';
+  if (d.priority !== 'mid' || /(متوسط|عادي|medium|normal priority)/.test(ln)) d.prioAsked = true;
+  if (orgOn() && depts().length) { const u = (a.unit && matchUnit(a.unit)) || matchUnit(ln, true); if (u) { d.unit = u; d.unitAsked = true; } else unitFromPeople(d); }
   return d;
 }
 const MATCH_STOP = new Set(['علي', 'بخصوص', 'بشان', 'الخاص', 'الخاصه', 'عن', 'الي', 'مع', 'من', 'في', 'and', 'the', 'for', 'with']);
@@ -1009,10 +1077,55 @@ function missingOf(d) {
   return null;
 }
 /** Optional fields still empty on a complete task draft — offered with «+» chips, never required. */
-const optMissing = d => isLogD(d) || missingOf(d) ? [] : [d.due && !d.time ? 'time' : '', !d.project ? 'project' : ''].filter(Boolean);
+const optMissing = d => isLogD(d) || missingOf(d) || softOf(d) ? [] : [d.due && !d.time ? 'time' : '', !d.project ? 'project' : ''].filter(Boolean);
 const OPT_LBL = { time: 'fTime', project: 'tcProject' };
-const extraOn = () => { const e = CH.extra, n = e ? CH.drafts.findIndex(d => d.id === e.id) : -1; if (n < 0 || isLogD(CH.drafts[n]) || pending()) return (CH.extra = null); return { n, k: e.k }; };
+const extraOn = () => { const e = CH.extra, n = e ? CH.drafts.findIndex(d => d.id === e.id) : -1; if (n < 0 || isLogD(CH.drafts[n]) || pending() || softPending()) return (CH.extra = null); return { n, k: e.k }; };
 const pending = () => { for (let n = 0; n < CH.drafts.length; n++) { const m = missingOf(CH.drafts[n]); if (m) return { n, d: CH.drafts[n], m }; } return null; };
+/** The questions worth asking once the required ones are answered — never blocking: «تخطَّ» or saving skips them. */
+function softOf(d) {
+  if (isLogD(d) || !askMore() || d.softSkip) return null;
+  if (!d.prioAsked && d.priority === 'mid') return 'prio';
+  if (orgOn() && depts().length && !d.unitAsked && !unitById(d.unit)) return 'unit';
+  return null;
+}
+/** A draft takes the department of the people it follows up (set once on each person), unless the user chose one. */
+function unitFromPeople(d) {
+  if (isLogD(d) || unitById(d.unit) || !orgOn()) return;
+  const ids = [...new Set(d.people.filter(p => p.ref.kind === 'known' && p.role !== 'related').map(p => unitOfPerson(p.ref.id)).filter(Boolean))];
+  if (ids.length === 1) d.unit = ids[0]; else if (ids.length > 1) { const dd = [...new Set(ids.map(i => deptOf(i)?.id))]; if (dd.length === 1) d.unit = dd[0]; }
+}
+const recentUnits = () => { const c = new Map(); live().forEach(x => { if (unitById(x.unit_id)) c.set(x.unit_id, (c.get(x.unit_id) || 0) + 1); }); return [...c].sort((a, b) => b[1] - a[1]).map(([id]) => id); };
+const softPending = () => { if (pending()) return null; for (let n = 0; n < CH.drafts.length; n++) { const k = softOf(CH.drafts[n]); if (k) return { n, d: CH.drafts[n], k }; } return null; };
+const softLeft = k => CH.drafts.filter(d => softOf(d) === k).length;
+function softHTML({ n, d, k }) {
+  const lead = CH.drafts.length > 1 ? `<b class="qn">${t('taskN', { n: n + 1 })}</b> ` : '';
+  const ttl = `«${esc(d.title.length > 60 ? d.title.slice(0, 60) + '…' : d.title)}»`;
+  const left = softLeft(k);
+  let q = '', opts = '';
+  if (k === 'unit') {
+    q = t('askUnitQ', { t: ttl });
+    const pick = UI.askUnitDept && unitById(UI.askUnitDept) ? UI.askUnitDept : null;
+    if (pick) opts = `<button type="button" class="chip primary-chip" data-act="anssoft" data-v="${pick}" ${left > 1 ? '' : ''}>${esc(unitById(pick).name)} ${t('wholeDept')}</button>` + secsOf(pick).map(sc => `<button type="button" class="chip" data-act="anssoft" data-v="${sc.id}" dir="auto">↳ ${esc(sc.name)}</button>`).join('') + `<button type="button" class="chip ghost" data-act="unitback">${t('back')}</button>`;
+    else { const ds = [...new Set([...recentUnits().map(i => deptOf(i)?.id).filter(Boolean), ...depts().map(x => x.id)])].slice(0, 10); opts = ds.map(id => `<button type="button" class="chip" data-act="${secsOf(id).length ? 'unitdept' : 'anssoft'}" data-v="${id}" dir="auto">${esc(unitById(id).name)}${secsOf(id).length ? ' ›' : ''}</button>`).join('') + (left > 1 && CH.lastUnit && unitById(CH.lastUnit) ? `<button type="button" class="chip primary-chip" data-act="anssoft" data-all="1" data-v="${CH.lastUnit}" dir="auto">${esc(t('unitForAll', { u: unitLabel(CH.lastUnit, true), n: left }))}</button>` : ''); }
+    opts += `<button type="button" class="chip" data-act="anssoft" data-v="">${t('noUnit')}</button>`;
+  }
+  if (k === 'prio') { q = t('askPrioQ', { t: ttl }); opts = [['hi', 'prioHi'], ['mid', 'prioMid'], ['lo', 'prioLo']].map(([v, l]) => `<button type="button" class="chip" data-act="anssoft" data-v="${v}">${t(l)}</button>`).join('') + (left > 1 ? `<button type="button" class="chip primary-chip" data-act="anssoft" data-v="mid" data-all="1">${t('prioAllMid', { n: left })}</button>` : ''); }
+  return `<div class="ask q soft"><p>${lead}${q}</p><div class="opts">${opts}<button type="button" class="chip ghost" data-act="skipsoft">${t('skipQs')}</button></div><small class="note">${t('softNote')}</small></div>`;
+}
+function setSoft(d, k, v) { if (k === 'prio') { if (['hi', 'mid', 'lo'].includes(v)) d.priority = v; d.prioAsked = true; } if (k === 'unit') { d.unit = unitById(v) ? v : null; d.unitAsked = true; if (d.unit) CH.lastUnit = d.unit; UI.askUnitDept = null; } }
+/** Typed answer to a soft question. Returns false when the text is not an answer. */
+function answerSoft({ d, k }, text) {
+  const n = shortN(text); if (n.split(' ').length > 4) return false;
+  if (k === 'unit') {
+    if (/^(لا|بدون|من غير|مفيش|ولا اداره|ولا قسم|none|no)$/.test(n)) { setSoft(d, k, ''); return true; }
+    const id = matchUnit(text); if (!id) return false; setSoft(d, k, id); return true;
+  }
+  if (k === 'prio') {
+    const v = /(عاليه|عالي|عاجل|مستعجل|ضروري|مهم|high|urgent)/.test(n) ? 'hi' : /(منخفض|منخفضه|مش مستعجل|مش مهم|عادي جدا|low)/.test(n) ? 'lo' : /(متوسط|متوسطه|عادي|عاديه|medium|normal)/.test(n) ? 'mid' : null;
+    if (!v) return false; setSoft(d, k, v); return true;
+  }
+  return false;
+}
 
 /* ---------- open / render ---------- */
 function openChat(prefill = '') {
@@ -1020,7 +1133,7 @@ function openChat(prefill = '') {
   openSheet(`<span class="chat-t">${sic('spark', 18)} ${t('assistant')}</span>`, `<div class="chat-log" id="chatLog"></div>
     <div class="chat-foot"><div class="chat-sugg" id="chatSugg"></div>
       <div class="composer"><textarea id="chatIn" rows="1" placeholder="${esc(t('chatPh'))}" aria-label="${esc(t('chatPh'))}" dir="auto"></textarea>
-        <div class="tools"><span id="recState" class="rec-state"></span><button type="button" class="linkbtn sm" data-act="newtask">${sic('edit', 15)} ${t('manualEntry')}</button><button type="button" class="mic" id="micBtn" data-act="mic" aria-label="${esc(t('speak'))}">${ic.mic}</button><button type="button" class="send" id="chatSendBtn" data-act="chatsend" aria-label="${esc(t('send'))}">${ic.send}</button></div></div></div>`, {
+        <div class="tools"><span id="recState" class="rec-state"></span><button type="button" class="iconbtn sm clipbtn" data-act="chatattach" aria-label="${esc(t('attachSheet'))}" title="${esc(t('attachSheet'))}">${sic('clip', 18)}</button><button type="button" class="linkbtn sm" data-act="newtask">${sic('edit', 15)} ${t('manualEntry')}</button><button type="button" class="mic" id="micBtn" data-act="mic" aria-label="${esc(t('speak'))}">${ic.mic}</button><button type="button" class="send" id="chatSendBtn" data-act="chatsend" aria-label="${esc(t('send'))}">${ic.send}</button></div></div></div>`, {
     cls: 'chat', onMount: sh => { const ta = sh.querySelector('#chatIn'); ta.addEventListener('input', () => autoGrow(ta)); if (prefill) ta.value = prefill; }
   });
   renderChat(true);
@@ -1031,9 +1144,9 @@ function renderChat(scroll = true) {
   const log = $('#chatLog'); if (!log) return;
   const pend = pending();
   const drafts = CH.drafts.length || CH.thinking ? `<div class="bubble bot drafts">${CH.drafts.length > 1 ? `<div class="dh">${CH.drafts.every(isLogD) ? t('nLogsFound', { n: plural(CH.drafts.length, 'logs') }) : CH.drafts.some(isLogD) ? t('nItemsFound', { n: plural(CH.drafts.length, 'items') }) : t('nTasksFound', { n: plural(CH.drafts.length, 'tasks') })}</div>` : ''}${CH.drafts.map((d, n) => draftCard(d, n, pend && pend.n === n)).join('')}
-      ${CH.thinking ? `<div class="thinking"><span class="dots"><i></i><i></i><i></i></span>${t(CH.drafts.length ? 'improving' : 'understanding')}</div>` : pend ? questionHTML(pend) : extraOn() ? extraHTML(extraOn()) : `${optLine()}<div class="ready">${sic('check', 16)} ${CH.drafts.some(isLogD) ? t(CH.drafts.length > 1 ? 'readyItems' : 'readyLog') : CH.drafts.length > 1 ? t('readyAll', { n: plural(CH.drafts.length, 'tasks') }) : t('readyOne')}</div>`}
+      ${CH.thinking ? `<div class="thinking"><span class="dots"><i></i><i></i><i></i></span>${t(CH.drafts.length ? 'improving' : 'understanding')}</div>` : pend ? questionHTML(pend) : softPending() ? softHTML(softPending()) : extraOn() ? extraHTML(extraOn()) : `${optLine()}<div class="ready">${sic('check', 16)} ${CH.drafts.some(isLogD) ? t(CH.drafts.length > 1 ? 'readyItems' : 'readyLog') : CH.drafts.length > 1 ? t('readyAll', { n: plural(CH.drafts.length, 'tasks') }) : t('readyOne')}</div>`}
       ${CH.drafts.length ? `<div class="save-row"><button type="button" class="btn primary block" data-act="chatsave" ${pend || CH.thinking ? 'disabled' : ''}>${ic.check}${CH.drafts.length > 1 ? t('saveAll', { n: CH.drafts.length }) : t('save')}</button><button type="button" class="btn" data-act="chatdiscard">${t('discardDrafts')}</button></div>` : ''}</div>` : '';
-  log.innerHTML = CH.msgs.map(m => `<div class="bubble ${m.who}">${m.html}</div>`).join('') + drafts;
+  log.innerHTML = CH.msgs.map(m => `<div class="bubble ${m.who}">${m.html}</div>`).join('') + drafts + actionsHTML();
   const sb2 = $('#chatSendBtn'); if (sb2) sb2.disabled = !!CH.thinking;
   const sg = $('#chatSugg');
   if (sg) sg.innerHTML = CH.drafts.length ? '' : `<button type="button" class="chip" data-act="chatfill">${sic('check', 14)}${t('qLog')}</button>` + QCHIPS.map(([k, q]) => `<button type="button" class="chip" data-act="chatq" data-q="${esc(q)}" data-l="${esc(t(k))}">${t(k)}</button>`).join('');
@@ -1062,6 +1175,7 @@ function draftCard(d, n, active) {
     d.source === SELF && !askSource() ? '' : d.source ? `<span class="chip sm">${t('srcShort')}: ${esc(srcLabel(d.source))}</span>` : `<span class="chip sm missing">${t('srcShort')}: ${L() === 'ar' ? '؟' : '?'}</span>`,
     ...ppl.map(p => `<span class="chip sm ${p.ref.kind === 'generic' || p.ref.kind === 'amb' ? 'missing' : ''}">${sic(p.role === 'waiting' ? 'clock' : 'users', 13)}<span dir="auto">${esc(refName(p.ref))}</span>${p.ref.kind === 'new' && p.ref.desc ? `<small dir="auto">· ${esc(p.ref.desc)}</small>` : ''}${p.ref.kind === 'new' ? ` <em>${t('newBadge')}</em>` : ''}</span>`),
     d.project ? `<span class="chip sm" dir="auto">${esc(d.project)}</span>` : '',
+    unitById(d.unit) ? `<span class="chip sm" dir="auto">${sic('org', 13)}${esc(unitLabel(d.unit, true))}</span>` : '',
     ...(CH.thinking ? [] : optMissing(d).map(k => `<button type="button" class="chip sm plus ${CH.extra && CH.extra.id === d.id && CH.extra.k === k ? 'on' : ''}" data-act="draftadd" data-n="${n}" data-k="${k}" aria-label="${esc(t('addField', { f: t(OPT_LBL[k]) }))}"><b aria-hidden="true">+</b>${t(OPT_LBL[k])}</button>`)),
   ].filter(Boolean).join('');
   return `<div class="dcard ${active ? 'active' : ''} ${missingOf(d) ? '' : 'ok'}">
@@ -1109,6 +1223,116 @@ function answerExtra({ n, k }, text) {
   d.project = text.replace(/\s+/g, ' ').trim().slice(0, 80); CH.extra = null; return true;
 }
 
+/* ---------- the chat runs the whole app: departments, people, statuses, screens ----------
+   A command is understood on the device when it is plain («ضيف إدارة X وتحتها قسم Y»), otherwise by the assistant.
+   Anything that changes data is shown as a card first and runs only when the user approves it. */
+const ST_WORDS = [[/(قيد المراجعه|للمراجعه|تحت المراجعه|review)/, 'review'], [/(جاري|جاريه|قيد التنفيذ|شغال|بدات|بدأت|in progress)/, 'prog'], [/(متوقف|متوقفه|معلق|معلقه|اوقف|on hold)/, 'hold'], [/(لم تبدا|جديد|جديده|not started)/, 'todo'], [/(مكتمل|مكتمله|خلصت|خلصانه|منجز|منجزه|اتقفلت|done|complete)/, 'done'], [/(بانتظار|منتظر|مستني|waiting)/, 'wait']];
+const stOfWords = n => { const h = ST_WORDS.find(([rx]) => rx.test(n)); return h ? h[1] : null; };
+/** Open tasks that best match a description (shared significant words), best first. */
+function findTasks(desc) {
+  const sig = s2 => nameTokens(s2).map(w => w.length > 4 ? w.replace(/^ال/, '') : w).filter(w => w.length > 2 && !MATCH_STOP.has(w));
+  const a = sig(desc); if (!a.length) return [];
+  const ref = (String(desc).match(/\b\d{3,8}\b/) || [])[0];
+  return live().filter(x => !isLog(x) && !x.archived).map(x => {
+    if (ref && x.ext_ref === ref) return [x, 9];
+    const b = sig(x.title); const hit = a.filter(w => b.some(v => v === w || (v.length > 3 && w.length > 3 && (v.includes(w) || w.includes(v))))).length;
+    return [x, hit / Math.max(2, Math.min(a.length, b.length)) + (isOpen(x) ? 0.05 : 0)];
+  }).filter(([, sc]) => sc >= 0.5).sort((p, q) => q[1] - p[1]).map(([x]) => x).slice(0, 4);
+}
+const AR_SPLIT = /\s*(?:،|,|؛|\s+و(?=\s*(?:قسم|ال|[^\s]))|\n)\s*/;
+const cleanName = v => String(v || '').replace(/^[«"']|[»"'.؟?!]$/g, '').replace(/\s+/g, ' ').trim();
+/** A plain command typed in the chat, or null. Returns a list of planned actions. */
+function localCommand(text) {
+  const raw = String(text || '').replace(/\s+/g, ' ').trim(); const n = normAr(raw);
+  if (raw.length > 400) return null;
+  let m;
+  // screens
+  if ((m = /^(افتح|اعرض|وريني|روح|ودني|خدني)\s+(?:لي\s+)?(?:صفحه\s+|شاشه\s+)?(الادارات|الاقسام|الادارات والاقسام|التقرير|الحصاد|تقرير الشهر|الجدول|جدول المهام|الاعدادات|الاشعارات|الاشخاص|المكتبه)\s*$/.exec(n))) {
+    const k = /الادارات|الاقسام/.test(m[2]) ? 'org' : /تقرير|حصاد/.test(m[2]) ? 'harvest' : /جدول/.test(m[2]) ? 'table' : /اعدادات/.test(m[2]) ? 'more' : /اشعارات/.test(m[2]) ? 'notifs' : /اشخاص/.test(m[2]) ? 'people' : 'library';
+    return [{ op: 'open', screen: k }];
+  }
+  if (/^(ارفع|استورد|حمل|ضيف|اضف)\s+(شيت|ملف|اكسل|excel)/.test(n)) return [{ op: 'open', screen: 'sheet' }];
+  if (!orgOn()) return null;
+  // «ضيف إدارة X (وتحتها|فيها) قسم Y، Z»
+  if ((m = /^(?:ضيف|ضيفي|اضف|أضف|اضيف|انشئ|أنشئ|اعمل|سجل)\s+(?:لي\s+)?(?:اداره|إدارة|ادارة)\s+(.+?)(?:\s+(?:و\s*)?(?:تحتها|فيها|جواها|بها|وتحتها|وفيها|تتبعها|ويتبعها)\s+(?:الاقسام|الأقسام|اقسام|أقسام|قسم|قسمين)?\s*:?\s*(.+))?$/.exec(raw))) {
+    const d = cleanName(m[1]).replace(/^(ال)?(اداره|إدارة)\s+/, ''); if (!d) return null;
+    const dn = /^(إدارة|ادارة|اداره)\s/.test(d) ? d : 'إدارة ' + d;
+    const secs = m[2] ? m[2].split(AR_SPLIT).map(x => cleanName(x)).filter(Boolean).map(x => /^قسم\s/.test(x) ? x : 'قسم ' + x) : [];
+    return [{ op: 'add_unit', kind: 'dept', name: dn }, ...secs.map(sc => ({ op: 'add_unit', kind: 'sec', name: sc, parent: dn }))];
+  }
+  // «ضيف قسم X (في|لـ|تحت) إدارة Y»
+  if ((m = /^(?:ضيف|اضف|أضف|اعمل|انشئ)\s+(?:اقسام|أقسام|قسم|قسمين)\s+(.+?)\s+(?:في|تحت|ل|لـ|على|علي|الى|إلى|جوه)\s*(?:ال)?(?:اداره|إدارة|ادارة)\s+(.+)$/.exec(raw))) {
+    const pid = matchUnit('إدارة ' + cleanName(m[2])) || matchUnit(m[2]); const pn = pid ? deptOf(pid).name : 'إدارة ' + cleanName(m[2]).replace(/^(إدارة|ادارة|اداره)\s+/, '');
+    return m[1].split(AR_SPLIT).map(x => cleanName(x)).filter(Boolean).map(x => ({ op: 'add_unit', kind: 'sec', name: /^قسم\s/.test(x) ? x : 'قسم ' + x, parent: pn }));
+  }
+  // «مأمون (تبع|في|من) قسم الجودة» / «اربط مأمون بإدارة X»
+  if ((m = /^(?:اربط\s+)?(.+?)\s+(?:تبع|تابع ل|تابع|يتبع|بيتبع|في|من|ب|بـ)\s*(?:ال)?(اداره|إدارة|ادارة|قسم)\s+(.+)$/.exec(raw)) && m[1].split(' ').length <= 5) {
+    const pid = matchPersonLoose(cleanName(m[1]).replace(/^(اربط|خلي)\s+/, '')); const uid = matchUnit(m[2] + ' ' + cleanName(m[3]));
+    if (pid && uid) return [{ op: 'map_person', person: pid, unit: uid }];
+  }
+  // «خلي مهمة X قيد المراجعة» / «حوّل X لجارية»
+  if ((m = /^(?:خلي|خليه|خليها|حول|حوّل|غير|غيّر|اجعل|حط)\s+(?:حاله\s+|حالة\s+)?(?:مهمه\s+|مهمة\s+|المهمه\s+|المهمة\s+)?(.+?)\s+(?:الى\s+|إلى\s+|ل|لـ|تبقى\s+|تكون\s+|على\s+)?(قيد المراجعة|قيد المراجعه|للمراجعة|جارية|جاريه|جاري|قيد التنفيذ|متوقفة|متوقفه|معلقة|معلقه|لم تبدأ|لم تبدا|جديدة|جديده|مكتملة|مكتمله|منجزة|منجزه)\s*$/.exec(raw))) {
+    const st = stOfWords(normAr(m[2])); const cands = findTasks(m[1]);
+    if (st && cands.length) return [{ op: 'set_status', status: st, cands: cands.map(x => x.id), task: cands.length === 1 || /\d{3,8}/.test(m[1]) ? cands[0].id : null }];
+  }
+  return null;
+}
+/** The assistant's actions → the same plan (names resolved on the device; nothing of the stored tasks is sent to it). */
+function planActions(list) {
+  const out = [];
+  (list || []).slice(0, 30).forEach(a => {
+    if (!a || !a.op) return;
+    if (a.op === 'open' && a.screen) return out.push({ op: 'open', screen: a.screen });
+    if (!orgOn() && a.op !== 'set_status') return;
+    if (a.op === 'add_unit' && a.name) return out.push({ op: 'add_unit', kind: a.parent ? 'sec' : 'dept', name: cleanName(a.name).slice(0, 150), parent: a.parent ? cleanName(a.parent).slice(0, 150) : null });
+    if (a.op === 'map_person' && a.person && a.unit) { const pid = matchPersonLoose(a.person); const uid = matchUnit(a.unit) || null; if (pid) out.push({ op: 'map_person', person: pid, unit: uid, unitName: uid ? null : cleanName(a.unit) }); return; }
+    if ((a.op === 'set_status' || a.op === 'set_unit') && a.task) { const cands = findTasks(a.task); if (!cands.length) return; const st = a.op === 'set_status' ? (['todo', 'prog', 'wait', 'review', 'hold', 'done'].includes(a.status) ? a.status : stOfWords(normAr(a.status || ''))) : null; if (a.op === 'set_status' && !st) return; const uid = a.op === 'set_unit' ? matchUnit(a.unit || '') : null; if (a.op === 'set_unit' && !uid) return; out.push({ op: a.op, status: st, unit: uid, cands: cands.map(x => x.id), task: cands.length === 1 ? cands[0].id : null }); }
+  });
+  return out;
+}
+const actReady = () => (CH.actions || []).every(a => !a.cands || a.task);
+function actLine(a, i) {
+  if (a.op === 'add_unit') { const exists = a.kind === 'dept' ? depts().some(d => normAr(d.name) === normAr(a.name)) : false; return `${sic('org', 15)} <span dir="auto">${a.kind === 'dept' ? t('actAddDept', { n: esc(a.name) }) : t('actAddSec', { n: esc(a.name), d: esc(a.parent || '') })}</span>${exists ? ` <em class="muted">${t('actExists')}</em>` : ''}`; }
+  if (a.op === 'map_person') return `${sic('users', 15)} <span dir="auto">${t('actMap', { p: esc(pname(a.person)), u: esc(a.unit ? unitLabel(a.unit) : a.unitName || '') })}</span>`;
+  if (a.op === 'set_status' || a.op === 'set_unit') {
+    const what = a.op === 'set_status' ? `<span class="pill ${{ prog: 'prog', wait: 'wait', review: 'review', done: 'done' }[a.status] || ''}">${t(stKey(a.status))}</span>` : `<b dir="auto">${esc(unitLabel(a.unit))}</b>`;
+    if (a.task) return `${sic('check', 15)} <span dir="auto">${t(a.op === 'set_status' ? 'actStatus' : 'actUnit', { t: esc(taskById(a.task)?.title.slice(0, 70) || '') })}</span> ${what}`;
+    return `${sic('check', 15)} <span>${t('actWhich')}</span> ${what}<div class="opts">${a.cands.map(id => `<button type="button" class="chip" data-act="actpick" data-i="${i}" data-v="${id}" dir="auto">${esc(taskById(id)?.title.slice(0, 60) || '')}</button>`).join('')}</div>`;
+  }
+  return '';
+}
+function actionsHTML() {
+  const A = CH.actions || []; if (!A.length) return '';
+  return `<div class="bubble bot drafts actcard"><div class="dh">${t('actTitle')}</div><ul class="actlist">${A.map((a, i) => `<li>${actLine(a, i)}</li>`).join('')}</ul>
+    <div class="save-row"><button type="button" class="btn primary block" data-act="actrun" ${actReady() ? '' : 'disabled'}>${ic.check}${t('actRun')}</button><button type="button" class="btn" data-act="actdrop">${t('cancel')}</button></div></div>`;
+}
+function runActions() {
+  const A = (CH.actions || []).filter(a => !a.cands || a.task); CH.actions = null;
+  const done = [];
+  A.forEach(a => {
+    if (a.op === 'add_unit') {
+      if (a.kind === 'dept') { const before = depts().length; ensureDept(a.name); if (depts().length > before) done.push(t('actDoneDept', { n: a.name })); }
+      else { const pid = ensureDept(a.parent || ''); if (pid && addSecs(pid, [a.name])) done.push(t('actDoneSec', { n: a.name })); }
+    } else if (a.op === 'map_person') { const p = personById(a.person); const uid = a.unit || (a.unitName ? ensureDept(a.unitName) : null); if (p && uid) { p.unit_id = uid; putPerson(p); done.push(t('actDoneMap', { p: p.name, u: unitLabel(uid) })); } }
+    else if (a.op === 'set_status') {
+      const x = taskById(a.task); if (!x || x.status === a.status) return;
+      if (a.status === 'done') { x.status = 'done'; x.completed_on = T(); addLog(x, 'completed'); spawnNext(x); putTask(x); }
+      else if (a.status === 'wait' && !x.waiting_on) { x.status = 'prog'; putTask(x); }
+      else setStatus(x, a.status);
+      done.push(t('actDoneStatus', { t: x.title.slice(0, 50), s: t(stKey(a.status)) }));
+    } else if (a.op === 'set_unit') { const x = taskById(a.task); if (x) { x.unit_id = a.unit; addLog(x, 'edited'); putTask(x); done.push(t('actDoneUnit', { t: x.title.slice(0, 50), u: unitLabel(a.unit) })); } }
+  });
+  botSay(done.length ? t('actDone', { n: done.length }) + '\n' + done.join('\n') : t('actNothing'));
+  renderChat();
+}
+function openScreen(k) {
+  if (k === 'sheet') return pickSheet();
+  closeSheet(true);
+  if (k === 'org') return openOrg(); if (k === 'harvest') return openHarvest(); if (k === 'notifs') return openNotifSheet();
+  if (k === 'table') { UI.tview = 'table'; return go('tasks'); }
+  return go(k === 'more' ? 'more' : k);
+}
+
 /* ---------- sending ---------- */
 const QUERY_RE = /(^|\s)(هات|اعرض|وريني|ورّيني|ايه|إيه|ما هي|ماهي|مين|من عنده|كام|عندي ايه|عندي إيه|اللي عليا|اللي علي|ملخص|show|list|what|who|which|summary)(\s|$|\?|؟)/;
 const CONFIRM_RE = /^(تمام|ماشي|اوك|اوكي|ok|okay|حفظ|احفظ|احفظهم|احفظها|احفظ الكل|ضيف|ضيفهم|ضيفها|ضيفه|اضف|اضفهم|سجل|سجلهم|سجلها|اعتمد|اعتمدهم|موافق|تم|يلا|كده تمام|تمام كده|تمام ضيفهم|تمام احفظ|save|yes|done)(\s|$)/;
@@ -1119,7 +1343,7 @@ const isCancel = text => { const n = shortN(text); return n.split(' ').length <=
 function hist(role, text) { if (!text) return; CH.hist.push({ role, text: String(text).slice(0, 600) }); if (CH.hist.length > 12) CH.hist.splice(0, CH.hist.length - 12); }
 const draftBrief = () => CH.drafts.map((d, i) => isLogD(d)
   ? { n: i + 1, kind: 'done', title: d.title, date: d.date, project: d.project || null }
-  : { n: i + 1, kind: 'task', title: d.title, due: d.due, no_due: !!d.noDue, time: d.time || null, recur: d.recur || null, priority: d.priority, role: d.role, source: d.source === SELF ? 'self' : d.source || null, project: d.project || null, people: d.people.map(p => ({ name: refName(p.ref), role: p.role })) });
+  : { n: i + 1, kind: 'task', title: d.title, due: d.due, no_due: !!d.noDue, time: d.time || null, recur: d.recur || null, priority: d.priority, role: d.role, source: d.source === SELF ? 'self' : d.source || null, project: d.project || null, unit: unitById(d.unit) ? unitLabel(d.unit) : null, people: d.people.map(p => ({ name: refName(p.ref), role: p.role })) });
 const botSay = (text, extra = '') => { CH.msgs.push({ who: 'bot', html: `<span dir="auto">${esc(text)}</span>${extra}` }); hist('model', text); };
 /** Apply one AI edit to a draft. */
 function applyEdit(d, e) {
@@ -1134,15 +1358,17 @@ function applyEdit(d, e) {
   if (e.no_due === true) { d.due = null; d.noDue = true; }
   if (validDate(e.due)) { d.due = e.due; d.noDue = false; d.weekendOk = false; }
   if (e.clear_time) d.time = null; else if (/^\d{2}:\d{2}$/.test(e.due_time || '')) d.time = e.due_time;
-  if (['hi', 'mid', 'lo'].includes(e.priority)) d.priority = e.priority;
+  if (['hi', 'mid', 'lo'].includes(e.priority)) { d.priority = e.priority; d.prioAsked = true; }
   if (['exec', 'follow', 'both'].includes(e.role)) d.role = e.role;
   if (e.source_self) d.source = SELF; else if (e.source) d.source = srcName(e.source);
   if (e.project != null) d.project = String(e.project || '').slice(0, 80);
+  if (e.unit != null && orgOn()) { const u = e.unit ? matchUnit(e.unit) : null; if (u || !e.unit) { d.unit = u; d.unitAsked = true; } }
   if (e.clear_recur) d.recur = null;
   else if (e.recur) { d.recur = cleanRecur(e.recur); if (d.recur && !validDate(e.due)) { d.due = recurNext(d.recur, addDays(T(), -1)); d.noDue = false; } }
   (e.remove_people || []).forEach(nm => { const k = normAr(nm); if (k) d.people = d.people.filter(p => { const r = normAr(refName(p.ref)); return !(r.includes(k) || k.includes(r)); }); });
   (e.add_people || []).forEach(p => { if (!p?.name) return; const ref = refOf(p.name, p.desc, !!p.generic); if (ref && !d.people.some(q => refName(q.ref) === refName(ref))) d.people.push({ ref, role: ['followup', 'waiting', 'related'].includes(p.role) ? p.role : 'followup', what: String(p.what || '').slice(0, 200), due: validDate(p.due) || null }); });
   if (d.people.some(p => p.role !== 'related') && d.role === 'exec') d.role = 'both';
+  unitFromPeople(d);
 }
 /** Drafts understood on-device only (AI off, offline or failed). */
 function localDrafts(text) {
@@ -1153,15 +1379,23 @@ function localDrafts(text) {
 const GREET_RE = /^(ازيك|إزيك|ازيكم|عامل ايه|السلام عليكم|سلام عليكم|مرحبا|اهلا|أهلا|هاي|هلا|صباح الخير|مساء الخير|hi|hello|hey)(\s|$|[!.،,؟?])/;
 async function chatSend(text, label) {
   text = String(text || '').trim(); if (!text || CH.thinking) return;
+  if (MIC) stopMic();
   if (!$('#chatLog')) openChat();
   CH.msgs.push({ who: 'me', html: `<span dir="auto">${esc(label || text)}</span>` }); hist('user', label || text);
   const ta = $('#chatIn'); if (ta) { ta.value = ''; autoGrow(ta); }
   const pend = pending();
+  // a pending command card: approve / cancel by word
+  if (CH.actions?.length) { if (isConfirm(text) && actReady()) return runActions(); if (isCancel(text)) { CH.actions = null; botSay(t('actCancelled')); renderChat(); return; } }
+  // plain commands are understood on the device
+  const lc = !pend && localCommand(text);
+  if (lc && lc.length) { if (lc.length === 1 && lc[0].op === 'open') { botSay(t('actOpening')); renderChat(); return openScreen(lc[0].screen); } CH.actions = lc; botSay(t('actConfirmQ')); renderChat(); return; }
   // quick, deterministic paths
   if (CH.drafts.length && !pend && isConfirm(text)) { saveDrafts(); return; }
   if (CH.drafts.length && isCancel(text)) { CH.drafts = []; CH.pick = new Set(); botSay(t('draftsDiscarded')); renderChat(); return; }
   if (pend && pend.m.k !== 'match' && isConfirm(text)) { botSay(t('stillMissing')); renderChat(); return; }
   if (pend && !QUERY_RE.test(' ' + normAr(text) + ' ') && answerText(pend, text)) { renderChat(); return; }
+  const sp = !pend && softPending();
+  if (sp && !isConfirm(text) && !QUERY_RE.test(' ' + normAr(text) + ' ') && answerSoft(sp, text)) { renderChat(); return; }
   const ex = !pend && extraOn();
   if (ex && !isConfirm(text) && !QUERY_RE.test(' ' + normAr(text) + ' ') && answerExtra(ex, text)) { renderChat(); return; }
   const looksQuery = /[?؟]\s*$/.test(text) || /^(هات|اعرض|وريني|ورّيني|ايه|إيه|ما هي|ماهي|مين|من عنده|كام|عندي ايه|عندي إيه|ملخص|show|list|what|who|which|summary)(\s|$)/.test(shortN(text)) || shortN(text).split(' ').length <= 5;
@@ -1180,7 +1414,7 @@ async function chatSend(text, label) {
   CH.thinking = true; CH.since = Date.now(); renderChat();
   const dropProv = () => { if (prov.length) { CH.drafts = CH.drafts.filter(d => !prov.includes(d)); prov = []; } };
   try {
-    const r = await invokeAssist({ v: 2, text: text.slice(0, 4000), history: CH.hist.slice(0, -1), drafts: prov.length ? [] : draftBrief(), pending: pend ? pend.m.k : null, today: T(), weekday: new Intl.DateTimeFormat('en', { weekday: 'long' }).format(pd(T())), lang: L(), weekend: weekendDays(), people: people().map(p => p.name), sources: recentSources() }, text.length > 450 ? 34000 : 22000);
+    const r = await invokeAssist({ v: 2, text: text.slice(0, 4000), history: CH.hist.slice(0, -1), drafts: prov.length ? [] : draftBrief(), pending: pend ? pend.m.k : sp ? 'optional ' + sp.k : null, today: T(), weekday: new Intl.DateTimeFormat('en', { weekday: 'long' }).format(pd(T())), lang: L(), weekend: weekendDays(), people: people().map(p => p.name), sources: recentSources(), units: orgOn() ? units().map(u => unitLabel(u.id)) : [] }, text.length > 450 ? 34000 : 22000);
     dropProv();
     // 1) changes to the drafts already on screen
     const n0 = CH.drafts.length;
@@ -1198,6 +1432,7 @@ async function chatSend(text, label) {
     if (r.intent === 'save' && n0 && !fresh) { if (!pending()) { CH.thinking = false; saveDrafts(); return; } botSay(t('stillMissing')); }
     else if (r.intent === 'save') botSay(fresh ? t('reviewFirst') : (r.reply || t('nothingToSave')));
     else if (r.intent === 'cancel') { CH.drafts = []; botSay(r.reply || t('draftsDiscarded')); }
+    else if (r.intent === 'action' && (r.actions || []).length) { const pl = planActions(r.actions); const op = pl.length === 1 && pl[0].op === 'open' ? pl[0] : null; if (op) { if (r.reply) botSay(r.reply); renderChat(); CH.thinking = false; return openScreen(op.screen); } if (pl.length) { CH.actions = pl; botSay(r.reply || t('actConfirmQ')); } else botSay(t('actNotUnderstood')); }
     else if (r.intent === 'query' && r.query) { if (r.reply) botSay(r.reply); CH.msgs.push({ who: 'bot', html: queryHTML(normQuery(r.query)) }); }
     else if (r.reply) botSay(r.reply);
   } catch (e) {
@@ -1254,7 +1489,11 @@ function saveDrafts() {
       const lx = newTask({ kind: 'log', title: d.title.slice(0, 300) || t('untitled'), status: 'done', completed_on: d.date, due: null, project: d.project || '', source: '' });
       addLog(lx, 'logged'); putTask(lx); made.push(lx); continue;
     }
-    const x = newTask({ title: d.title.slice(0, 300) || t('untitled'), due: d.noDue && !d.recur ? null : d.due, due_time: d.time || null, recur: d.recur || null, priority: d.priority, role: d.role, source: d.source, project: d.project || '' });
+    const ex = d.extra || {};
+    const x = newTask({ title: d.title.slice(0, 300) || t('untitled'), due: d.noDue && !d.recur ? null : d.due, due_time: d.time || null, recur: d.recur || null, priority: d.priority, role: d.role, source: d.source, project: d.project || '', details: ex.details || '', notes: ex.notes || '', steps_total: ex.steps_total || 0, remind_min: ex.remind_min ?? null });
+    if (unitById(d.unit)) x.unit_id = d.unit;
+    if (ex.status && ex.status !== 'wait') x.status = ex.status;
+    if (ex.status === 'wait' && ex.waiting_on) { const wid = getOrCreatePerson(ex.waiting_on); if (wid) { x.status = 'wait'; x.waiting_on = wid; x.waiting_what = ex.waiting_what || 'reply'; } }
     addLog(x, 'created');
     const idOf = r => { if (r.kind === 'known') return r.id; const id = getOrCreatePerson(r.kind === 'new' ? r.name : r.label); const p = personById(id); if (p && r.desc && !p.org) { p.org = r.desc; putPerson(p); } return id; };
     for (const p of d.people) {
@@ -1282,13 +1521,15 @@ function saveDrafts() {
 function weekRange(td = T()) { const back = (pd(td).getDay() - weekStartDay() + 7) % 7; const s = addDays(td, -back); return [s, addDays(s, 6)]; }
 function localQuery(text) {
   const n = ' ' + normAr(text) + ' ';
+  if (orgOn() && depts().length && /(^|\s)(مهام|المهام|شغل|تاسكات|وضع|حاله|tasks|status)(\s|$)/.test(n) && /(اداره|قسم|قطاع|department|section)/.test(n) && n.trim().split(' ').length <= 8) { const u = matchUnit(text); if (u) return { type: 'unit', unit: u }; }
   if (!QUERY_RE.test(n) && !/(مهامي|مهام اليوم|مهام بكره|متاخرات|متابعاتي|my tasks)/.test(n)) return null;
   const td = T();
   if (/(متاخر|(^|\s)(overdue|late)(\s|$))/.test(n)) return { type: 'late' };
   if (/(واقف|متعطل|معلق|مين عنده|من عنده|who owes|pending follow)/.test(n)) return { type: 'followups' };
   if (/(مستني|منتظر|بانتظار|waiting)/.test(n)) return { type: 'waiting' };
   if (/(من غير موعد|بدون موعد|no due)/.test(n)) return { type: 'nodue' };
-  if (/(خلصت|انجزت|منجز|اكتمل|خلصته|عملت|عملته|انجازات|(^|\s)(done|completed|finished|did)(\s|$))/.test(n)) { if (/(النهارده|اليوم|today)/.test(n)) return { type: 'done', from: td, to: td }; if (/(امبارح|امس|yesterday)/.test(n)) return { type: 'done', from: addDays(td, -1), to: addDays(td, -1) }; if (/(الشهر|month)/.test(n)) return { type: 'done', from: td.slice(0, 8) + '01', to: td }; const [s] = weekRange(td); return { type: 'done', from: s, to: td }; }
+  if (/(خلصت|انجزت|منجز|اكتمل|خلصته|عملت|عملته|انجازات|(^|\s)(خلص|خلصو|خلصوا|اتعمل|اتنجز|انتهى|انتهت|done|completed|finished|did)(\s|$))/.test(n)) { if (/(النهارده|اليوم|today)/.test(n)) return { type: 'done', from: td, to: td }; if (/(امبارح|امس|yesterday)/.test(n)) return { type: 'done', from: addDays(td, -1), to: addDays(td, -1) }; if (/(الشهر|month)/.test(n)) return { type: 'done', from: td.slice(0, 8) + '01', to: td }; const [s] = weekRange(td); return { type: 'done', from: s, to: td }; }
+  if (orgOn() && /(اداره|قسم|قطاع|department|section)/.test(n)) { const u = matchUnit(text); if (u) return { type: 'unit', unit: u }; }
   const hit = findPeople(text, people()); if (hit.length && hit[0].ids.length === 1) return { type: 'person', person: hit[0].ids[0] };
   const pm = text.match(/مشروع\s+(.+?)(?:\s*[?؟]|$)/); if (pm) return { type: 'project', project: pm[1].trim() };
   if (/(الاسبوع الجاي|الاسبوع القادم|next week)/.test(n)) { const s = nextWeekday(td, weekStartDay()); return { type: 'due', from: s, to: addDays(s, 6) }; }
@@ -1301,13 +1542,15 @@ function localQuery(text) {
 function normQuery(q) {
   const out = { type: q.type || 'summary', from: validDate(q.from), to: validDate(q.to), project: q.project || '' };
   if (q.person) out.person = matchPerson(q.person) || null;
+  if (q.unit) out.unit = unitById(q.unit) ? q.unit : orgOn() ? matchUnit(q.unit) : null;
+  if (out.type === 'unit' && !out.unit) out.type = 'summary';
   if (out.type === 'due' && !out.from) out.from = out.to = T();
   if (out.type === 'due' && !out.to) out.to = out.from;
   if (out.type === 'done') { if (!out.from) out.from = weekRange()[0]; if (!out.to) out.to = T(); }
   if (out.type === 'person' && !out.person) out.type = 'summary';
   return out;
 }
-const qRow = x => `<button type="button" class="qrow ${isLate(x) ? 'late' : ''}" data-open="${x.id}"><span class="t" dir="auto">${esc(x.title)}</span><span class="meta">${statusPill(x)}${x.due ? `<span>${isLate(x) ? lateTxt(x.due) : rel(x.due)}</span>` : ''}${x.waiting_on ? `<span dir="auto">${sic('clock', 12)} ${esc(pname(x.waiting_on))}</span>` : ''}</span></button>`;
+const qRow = x => `<button type="button" class="qrow ${isLate(x) ? 'late' : ''}" data-open="${x.id}"><span class="t" dir="auto">${esc(x.title)}</span><span class="meta">${statusPill(x)}${x.status === 'done' ? (x.completed_on ? `<span>${x.completed_on === T() ? t('today') : x.completed_on === addDays(T(), -1) ? t('yesterday') : `${wd(x.completed_on)} ${fmtShort(x.completed_on)}`}</span>` : '') : x.due ? `<span>${isLate(x) ? lateTxt(x.due) : rel(x.due)}</span>` : ''}${x.waiting_on ? `<span dir="auto">${sic('clock', 12)} ${esc(pname(x.waiting_on))}</span>` : ''}</span></button>`;
 const qFu = (x, f) => `<div class="qrow fu ${fuLate(f) ? 'late' : ''}"><span class="av sm">${esc(initials(pname(f.person_id)))}</span><span class="body" data-open="${x.id}" role="button" tabindex="0"><span class="t" dir="auto">${esc(pname(f.person_id))}</span><span class="meta"><span dir="auto">${esc(f.what || x.title)}</span><span>${fuLate(f) ? lateTxt(f.due) : rel(f.due)}</span></span></span><button type="button" class="btn sm" data-act="furesult" data-id="${x.id}" data-fu="${esc(f.id)}">${t('logResult')}</button></div>`;
 function queryHTML(q) {
   const open = live().filter(x => isOpen(x) && !x.archived);
@@ -1316,7 +1559,7 @@ function queryHTML(q) {
   const rangeLabel = (a, b) => a === b ? (a === T() ? t('today') : a === addDays(T(), 1) ? t('tomorrow') : `${wd(a)} ${fmtShort(a)}`) : `${fmtShort(a)} – ${fmtShort(b)}`;
   switch (q.type) {
     case 'late': { const ts = sortTasks(open.filter(isLate)); const fs = fus.filter(([, f]) => fuLate(f)); return list(ts.length && fs.length ? t('qaLate', { n: plural(ts.length, 'tasks'), m: plural(fs.length, 'fus') }) : t('qaLate1', { n: plural(ts.length || fs.length, ts.length ? 'tasks' : 'fus') }), [...ts.map(qRow), ...fs.map(([x, f]) => qFu(x, f))], t('qaNothingLate')); }
-    case 'waiting': { const ts = sortTasks(open.filter(x => x.status === 'wait')); return list(t('qaWaiting', { n: ts.length }), ts.map(qRow), t('qaNone')); }
+    case 'waiting': { const ts = sortTasks(open.filter(isWaitLike)); return list(t('qaWaiting', { n: ts.length }), ts.map(qRow), t('qaNone')); }
     case 'nodue': { const ts = sortTasks(open.filter(x => !x.due)); return list(t('qaNoDue', { n: ts.length }), ts.map(qRow), t('qaNone')); }
     case 'followups': {
       const by = new Map(); fus.forEach(([x, f]) => { if (!by.has(f.person_id)) by.set(f.person_id, []); by.get(f.person_id).push([x, f]); });
@@ -1325,6 +1568,8 @@ function queryHTML(q) {
       return `<div class="qhead">${t('qaFollow', { n: plural(groups.length, 'people') })}</div>${groups.length ? `<div class="qlist">${groups.map(([pid, items]) => { const late = items.filter(([, f]) => f && fuLate(f)).length; return `<button type="button" class="qrow" data-person="${pid}"><span class="av sm">${esc(initials(pname(pid)))}</span><span class="body"><span class="t" dir="auto">${esc(pname(pid))}</span><span class="meta"><span>${plural(items.length, 'openFu')}</span>${late ? `<span class="pill late">${t('nLate', { n: late })}</span>` : ''}</span><span class="sub" dir="auto">${esc(items.slice(0, 2).map(([x, f]) => f?.what || x.title).join(' · '))}</span></span></button>`; }).join('')}</div>` : `<div class="muted">${t('qaNone')}</div>`}`;
     }
     case 'person': { const pid = q.person; const ts = sortTasks(open.filter(x => x.waiting_on === pid)); const fs = fus.filter(([, f]) => f.person_id === pid); return list(t('qaPerson', { p: esc(pname(pid)), n: plural(ts.length + fs.length, 'items') }), [...ts.map(qRow), ...fs.map(([x, f]) => qFu(x, f))], t('qaNone')) + `<button type="button" class="linkbtn" data-person="${pid}">${t('openPerson')}</button>`; }
+    case 'unit': { const ts = sortTasks(open.filter(x => inUnit(x, q.unit))); const late = ts.filter(isLate).length; const byS = {}; ts.forEach(x => { const k = x.status; byS[k] = (byS[k] || 0) + 1; });
+      return list(t('qaUnit', { u: esc(unitLabel(q.unit)), n: plural(ts.length, 'tasks') }) + (ts.length ? `<div class="qsub">${Object.entries(byS).map(([k, n]) => `${t(stKey(k))}: <b class="num">${n}</b>`).join(' · ')}${late ? ` · <span class="late-txt">${t('nLate', { n: late })}</span>` : ''}</div>` : ''), ts.slice(0, 30).map(qRow), t('qaNone')) + `<button type="button" class="linkbtn" data-unitf="${q.unit}">${t('openUnitTasks')}</button>`; }
     case 'project': { const key = normAr(q.project); const ts = sortTasks(live().filter(x => normAr(x.project || '').includes(key) && isOpen(x))); return list(t('qaProject', { p: esc(q.project), n: plural(ts.length, 'tasks') }), ts.map(qRow), t('qaNone')); }
     case 'done': { const ts = live().filter(x => x.status === 'done' && x.completed_on >= q.from && x.completed_on <= q.to).sort((a, b) => a.completed_on < b.completed_on ? 1 : -1); const nl = ts.filter(isLog).length; return list(t('qaDone1', { r: rangeLabel(q.from, q.to), n: [ts.length - nl ? plural(ts.length - nl, 'doneN') : '', nl ? plural(nl, 'logs') : ''].filter(Boolean).join(' · ') || plural(0, 'doneN') }), ts.map(qRow), t('qaNoneDone')) + `<button type="button" class="linkbtn" data-act="chatfill">${sic('plus', 14)} ${t('qLog')}</button>`; }
     case 'due': { const ts = sortTasks(open.filter(x => x.due && x.due >= q.from && x.due <= q.to)); const fs = fus.filter(([, f]) => f.due >= q.from && f.due <= q.to); const late = q.from <= T() && q.to >= T() ? sortTasks(open.filter(isLate)) : [];
@@ -1340,45 +1585,75 @@ function briefHTML(plain) {
   const hello = plain ? '' : `<b>${t(hr < 12 ? 'goodMorning' : 'hello2', { n: esc(name) })}</b><br>`;
   if (!open.length) return hello + t('briefEmpty');
   if (!today && !fusToday && !late) return hello + t('briefClear') + `<div class="chips"><button type="button" class="chip" data-act="chatfill">${sic('check', 14)}${t('qLog')}</button>${qChip('qTomorrow')}</div>`;
-  return hello + t('brief', { a: plural(today, 'tasks'), b: plural(fusToday, 'fus'), c: plural(late, 'tasks') }) + `<div class="chips">${[['qToday', 1], ['qLate', late], ['qFollow', 1]].filter(([, v]) => v).map(([k]) => qChip(k)).join('')}</div>`;
+  const parts = [today ? (today === 2 && L() === 'ar' ? t('briefDue2') : t('briefDue', { n: plural(today, 'tasks') })) : '', fusToday ? plural(fusToday, 'fus') : '', late ? (late === 2 && L() === 'ar' ? t('briefLate2') : t('briefLate', { n: plural(late, 'tasks') })) : ''].filter(Boolean);
+  return hello + t('briefHead') + parts.join(L() === 'ar' ? '، و' : ', ') + '.' + `<div class="chips">${[['qToday', 1], ['qLate', late], ['qFollow', 1]].filter(([, v]) => v).map(([k]) => qChip(k)).join('')}</div>`;
 }
 
-/* ---------- voice ---------- */
-let rec = null, recTimer = null;
+/* ---------- voice ----------
+   Listening goes on until the user taps the mic again: a pause to think never ends it. The browser's own recognizer
+   stops after a silence (always on phones), so it is restarted at once and the words keep adding up in the box.
+   Nothing is sent by itself — the user reviews the text, edits it if needed, then taps send. */
+let rec = null, MIC = null;
 const IS_IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-function resetMic() { clearTimeout(recTimer); recTimer = null; rec = null; micUI(); }
+const IS_PHONE = IS_IOS || /android/i.test(navigator.userAgent);
+const MIC_IDLE = 60000; // a whole minute of silence ends listening (battery)
+const kbdKey = 'rafeeq2.micKbd';
+const micKbd = () => { try { return localStorage.getItem(kbdKey) === (window.RAFEEQ_VERSION || '1'); } catch { return false; } }; // retried once on each new release
+const setMicKbd = () => { try { localStorage.setItem(kbdKey, window.RAFEEQ_VERSION || '1'); } catch { } };
+function kbdHint(ta) { ta.focus(); toast(t(IS_IOS ? 'micUseKeyboard' : 'micUnsupported'), null, undefined, 4500); }
 function toggleMic() {
   const ta = $('#chatIn'); if (!ta) return;
-  if (IS_IOS || !SR) {
-    // iOS: the system keyboard's dictation is reliable everywhere (Safari and the home-screen app); the web speech API is not.
-    ta.focus(); toast(t('micUseKeyboard'), null, undefined, 4500); return;
-  }
-  if (rec) { try { rec.abort(); } catch { } resetMic(); return; }
+  if (MIC) return stopMic(true);
+  if (!SR || micKbd()) return kbdHint(ta);
   if (!navigator.onLine) { toast(t('micOffline'), null, 'err'); return; }
-  let r;
-  try { r = new SR(); } catch { toast(t('micUnsupported'), null, 'err'); return; }
-  rec = r; r.lang = L() === 'ar' ? 'ar-SA' : 'en-US'; r.interimResults = true; r.continuous = false; r.maxAlternatives = 1;
-  const base = ta.value ? ta.value.trimEnd() + ' ' : ''; let fin = '', heard = false;
-  const arm = ms => { clearTimeout(recTimer); recTimer = setTimeout(() => { if (rec === r) { try { r.abort(); } catch { } resetMic(); toast(t(heard ? 'micStopped' : 'micNoSpeech'), null, 'err'); } }, ms); };
-  r.onaudiostart = () => arm(12000);
-  r.onresult = e => { heard = true; arm(8000); let interim = ''; for (let k = e.resultIndex; k < e.results.length; k++) { const x = e.results[k]; if (x.isFinal) fin += x[0].transcript + ' '; else interim += x[0].transcript; } ta.value = base + fin + interim; autoGrow(ta); };
+  MIC = { ta, base: ta.value ? ta.value.trimEnd() + ' ' : '', fin: '', interim: '', ok: false, quiet: Date.now(), fast: 0 };
+  const S = MIC; ta.addEventListener('input', () => { if (MIC === S || S.closing) { S.base = ta.value.trimEnd() + ' '; S.fin = ''; S.interim = ''; } }); // the user's own edit while listening is kept
+  micStart(S); micUI();
+}
+function micShow(S) { if (!S.ta.isConnected) return; S.ta.value = (S.base + S.fin + S.interim).replace(/^\s+/, ''); autoGrow(S.ta); }
+function micStart(S) {
+  let r; try { r = new SR(); } catch { micEnd(S); toast(t('micUnsupported'), null, 'err'); return; }
+  rec = r; S.t0 = Date.now(); S.got = false;
+  r.lang = L() === 'ar' ? 'ar-SA' : 'en-US'; r.interimResults = true; r.maxAlternatives = 1;
+  r.continuous = !IS_PHONE; // phones misbehave in continuous mode (repeated words): short sessions, restarted
+  r.onresult = e => {
+    if (MIC !== S && S.closing !== r) return;
+    S.ok = S.got = true; S.quiet = Date.now(); let interim = '';
+    for (let k = e.resultIndex; k < e.results.length; k++) { const x = e.results[k], w = (x[0]?.transcript || '').trim(); if (!w) continue; if (x.isFinal) S.fin += w + ' '; else interim += w + ' '; }
+    S.interim = interim; micShow(S);
+  };
   r.onerror = ev => {
     if (rec !== r) return;
     const code = ev.error || '';
-    if (code === 'not-allowed' || code === 'service-not-allowed') toast(t('micDenied'), null, 'err');
-    else if (code === 'no-speech') toast(t('micNoSpeech'), null, 'err');
-    else if (code === 'network') toast(t('micNetwork'), null, 'err');
-    else if (code !== 'aborted') toast(t('micError'), null, 'err');
-    resetMic();
+    if (code === 'no-speech' || code === 'aborted') return; // a silence: onend restarts
+    if ((code === 'not-allowed' || code === 'service-not-allowed') && !S.ok && IS_IOS) { setMicKbd(); micEnd(S); kbdHint(S.ta); return; } // this iPhone mode has no web dictation: the keyboard's mic from now on
+    micEnd(S);
+    toast(t(code === 'not-allowed' || code === 'service-not-allowed' ? 'micDenied' : code === 'network' ? 'micNetwork' : 'micError'), null, 'err');
   };
-  r.onend = () => { if (rec !== r) return; resetMic(); const v = ($('#chatIn')?.value || '').trim(); if (v && heard && v !== base.trim()) chatSend(v); };
-  try { r.start(); arm(25000); } catch { resetMic(); toast(t('micError'), null, 'err'); return; }
-  micUI();
+  r.onend = () => {
+    if (S.closing === r) { S.closing = null; if (S.interim) { S.fin += S.interim; S.interim = ''; micShow(S); } return; }
+    if (rec !== r || MIC !== S) return;
+    if (S.interim) { S.fin += S.interim; S.interim = ''; micShow(S); } // some phones never mark the last words final
+    if (Date.now() - S.quiet > MIC_IDLE) { micEnd(S); toast(t(S.ok ? 'micIdle' : 'micNoSpeech'), null, S.ok ? undefined : 'err'); return; }
+    S.fast = !S.got && Date.now() - S.t0 < 700 ? S.fast + 1 : 0; // a recognizer that dies at once, again and again, is not coming back
+    if (S.fast >= 6) { micEnd(S); toast(t('micError'), null, 'err'); return; }
+    setTimeout(() => { if (MIC === S) micStart(S); }, S.fast ? 400 : 60);
+  };
+  try { r.start(); } catch { micEnd(S); toast(t('micError'), null, 'err'); }
 }
-function stopMic() { if (rec) { try { rec.abort(); } catch { } resetMic(); } }
+function micEnd(S) { if (MIC === S) MIC = null; rec = null; micUI(); }
+/** keep = the user tapped the mic to finish: let the last words arrive. Otherwise (sending, closing) drop them. */
+function stopMic(keep = false) {
+  const S = MIC; if (!S) return;
+  const r = rec; MIC = null; rec = null;
+  if (r) { if (keep) { S.closing = r; try { r.stop(); } catch { } setTimeout(() => { if (S.closing === r) { S.closing = null; try { r.abort(); } catch { } } }, 1500); } else { try { r.abort(); } catch { } } }
+  if (keep && S.interim) { S.fin += S.interim; S.interim = ''; micShow(S); }
+  micUI();
+  if (keep && S.ta.isConnected) { S.ta.focus(); if ((S.fin || '').trim()) toast(t('micReview'), null, undefined, 3500); }
+}
 function micUI() {
-  const b = $('#micBtn'); if (b) b.classList.toggle('rec', !!rec);
-  const s = $('#recState'); if (s) s.innerHTML = rec ? `<span class="wave">${'<i></i>'.repeat(7)}</span>${t('listening')}` : '';
+  const b = $('#micBtn'); if (b) { const on = !!MIC; if (b.classList.contains('rec') !== on) b.innerHTML = on ? I('<rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/>') : ic.mic; b.classList.toggle('rec', on); b.setAttribute('aria-label', t(on ? 'micStop' : 'speak')); }
+  const s = $('#recState'); if (s) s.innerHTML = MIC ? `<span class="wave">${'<i></i>'.repeat(7)}</span>${t('listeningLong')}` : '';
 }
 function autoGrow(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 160) + 'px'; }
 
@@ -1400,12 +1675,17 @@ function openRemind(x, f) {
 function logReminder(x, f) { f.log = f.log || []; f.log.push({ id: uuid(), at: nowISO(), date: T(), text: t('reminderSent'), outcome: 'reminded' }); addLog(x, 'fu_reminded', '', { person_id: f.person_id }); putTask(x); }
 
 /* ---------- full task form ---------- */
+/** A department/section picker: each department, then its sections under it. */
+function unitSelect(name, cur, emptyLbl) {
+  return `<select name="${name}"><option value="">${esc(emptyLbl || t('noUnit'))}</option>${depts().map(d => `<option value="${d.id}" ${cur === d.id ? 'selected' : ''}>${esc(d.name)}</option>${secsOf(d.id).map(sc => `<option value="${sc.id}" ${cur === sc.id ? 'selected' : ''}>&nbsp;&nbsp;&nbsp;↳ ${esc(sc.name)}</option>`).join('')}`).join('')}</select>`;
+}
 function openTaskForm(x, pre = null) {
-  const isNew = !x; const v = x ? (pre?.status ? { ...x, status: pre.status } : x) : newTask(pre ? { title: pre.title || '', due: pre.due || null, due_time: pre.time || null, recur: pre.recur || null, priority: pre.priority || 'mid', role: pre.role || 'exec', source: pre.source || (askSource() ? '' : SELF), project: pre.project || '' } : { source: askSource() ? '' : SELF });
+  const isNew = !x; const v = x ? (pre?.status ? { ...x, status: pre.status } : x) : newTask(pre ? { title: pre.title || '', due: pre.due || null, due_time: pre.time || null, recur: pre.recur || null, priority: pre.priority || 'mid', role: pre.role || 'exec', source: pre.source || (askSource() ? '' : SELF), project: pre.project || '', ...Object.fromEntries(Object.entries(pre.extra || {}).filter(([k, val]) => val !== undefined && k !== 'waiting_on')) } : { source: askSource() ? '' : SELF });
+  const isDraft = !!pre?.draftId;
   const rc = v.recur || null, rcDom = rc && rc.dom !== 'last' && rc.dom ? rc.dom : pd(v.due || T()).getDate(), rcDays = rc?.days?.length ? rc.days : [pd(v.due || T()).getDay()];
   const projects = [...new Set(live().map(y => (y.project || '').trim()).filter(Boolean))];
   const srcOpts = [...new Set([...recentSources(), ...people().map(p => p.name)])];
-  const stOpts = ['todo', 'prog', 'wait', 'hold'].concat(isNew ? [] : ['cancelled']);
+  const stOpts = OPEN_ST().concat(isNew ? [] : ['cancelled']);
   const whoNames = pre?.who || (x ? [...new Set(openFus(x).map(f => pname(f.person_id)))] : []);
   const noDue0 = pre ? !!pre.noDue : (!isNew && !v.due);
   openSheet(isNew ? t('newTask') : t('editTask'), `<form id="taskForm" class="form" autocomplete="off" novalidate>
@@ -1428,9 +1708,10 @@ function openTaskForm(x, pre = null) {
       <label class="fld" id="whoBox" ${v.role === 'exec' ? 'hidden' : ''}><span>${t('fWho')} <b class="req">*</b></span><input name="who" list="pplList" value="${esc(whoNames.join(L() === 'ar' ? '، ' : ', '))}" placeholder="${esc(t('personPhMulti'))}" dir="auto"></label>
       ${v.status === 'done' ? '' : `<label class="fld"><span>${t('fStatus')}</span><select name="status" id="fStatus">${stOpts.map(s => `<option value="${s}" ${v.status === s ? 'selected' : ''}>${t(stKey(s))}</option>`).join('')}</select></label>`}
       <div class="grid2" id="waitBox" ${v.status === 'wait' ? '' : 'hidden'}>
-        <label class="fld"><span>${t('fWaitingOn')}</span><input name="waiting_on" list="pplList" value="${esc(v.waiting_on ? pname(v.waiting_on) : '')}" dir="auto"></label>
+        <label class="fld"><span>${t('fWaitingOn')}</span><input name="waiting_on" list="pplList" value="${esc(pre?.extra?.waiting_on || (v.waiting_on ? pname(v.waiting_on) : ''))}" dir="auto"></label>
         <label class="fld"><span>${t('fWaitingWhat')}</span><select name="waiting_what">${['reply', 'decision', 'approval'].map(w => `<option value="${w}" ${v.waiting_what === w ? 'selected' : ''}>${t('w_' + w)}</option>`).join('')}</select></label>
       </div>
+      ${orgOn() && depts().length ? `<label class="fld"><span>${sic('org', 14)} ${t('fUnit')} <em>${t('optional')}</em></span>${unitSelect('unit', v.unit_id || pre?.unit || '')}</label>` : ''}
       <div class="grid2">
         <label class="fld"><span>${t('fProject')} <em>${t('optional')}</em></span><input name="project" list="projList" value="${esc(v.project)}" dir="auto"></label>
         <label class="fld"><span>${t('fSteps')} <em>${t('fStepsHint')}</em></span><input type="number" name="steps_total" min="0" max="50" inputmode="numeric" value="${v.steps_total || ''}"></label>
@@ -1440,7 +1721,8 @@ function openTaskForm(x, pre = null) {
       <datalist id="projList">${projects.map(p => `<option value="${esc(p)}"></option>`).join('')}</datalist>
       <datalist id="srcList">${srcOpts.map(p => `<option value="${esc(p)}"></option>`).join('')}</datalist>
       <p class="note err-txt" id="formErr" hidden></p>
-      <div class="save-row sticky"><button type="submit" class="btn primary block">${ic.check}${t('save')}</button></div>
+      <div class="save-row sticky"><button type="submit" class="btn primary block">${ic.check}${isDraft ? t('draftApply') : t('save')}</button></div>
+      ${isDraft ? `<p class="note">${t('draftApplyNote')}</p>` : ''}
     </form>`, {
     onMount: sh => {
       const f = sh.querySelector('#taskForm');
@@ -1469,6 +1751,20 @@ function openTaskForm(x, pre = null) {
         const whoList = role === 'exec' ? [] : String(fd.get('who') || '').split(/[،,+؛;]/).map(s => s.trim()).filter(Boolean);
         if (role !== 'exec' && !whoList.length) { f.elements.who.focus(); return err(t('reqWho')); }
         if (fd.get('status') === 'wait' && !String(fd.get('waiting_on') || '').trim()) { f.elements.waiting_on.focus(); return err(t('reqWaitingOn')); }
+        if (isDraft) { // editing a chat draft changes the draft only: nothing is saved until the user approves in the chat
+          const d = CH.drafts.find(y => y.id === pre.draftId); if (!d) { closeSheet(true); return openChat(); }
+          d.title = title.slice(0, 300); d.noDue = noDue && !recur; d.due = d.noDue ? null : dueV; d.weekendOk = !!(d.due && isWeekend(d.due)); d.recur = recur;
+          const tmv = fd.get('tm') || ''; d.time = /^\d{2}:\d{2}$/.test(tmv) ? tmv : null;
+          d.priority = fd.get('priority') || 'mid'; d.prioAsked = true; d.role = role; d.project = (fd.get('project') || '').trim();
+          if (f.elements.unit) { d.unit = unitById(f.elements.unit.value) ? f.elements.unit.value : null; d.unitAsked = true; }
+          d.source = !srcRaw || /^(أنا|انا|me|self)$/i.test(srcRaw) || srcRaw === t('srcSelf') ? SELF : srcName(srcRaw);
+          const keep = d.people.filter(p => p.role === 'waiting' || (p.role === 'related' && role === 'exec'));
+          const fu = whoList.map(nm => { const old = d.people.find(p => p.role !== 'waiting' && normAr(refName(p.ref)) === normAr(nm)); return old ? { ...old, role: 'followup' } : { ref: refOf(nm), role: 'followup', what: '', due: null }; }).filter(p => p.ref);
+          d.people = [...keep, ...fu];
+          const st = fd.get('status'); const rmv = fd.get('rm');
+          d.extra = { details: (fd.get('details') || '').trim(), notes: (fd.get('notes') || '').trim(), steps_total: Math.max(0, Math.min(50, parseInt(fd.get('steps_total') || '0', 10) || 0)), remind_min: d.time && rmv !== '' && rmv != null ? +rmv : null, status: st && st !== 'todo' ? st : undefined, waiting_on: st === 'wait' ? String(fd.get('waiting_on') || '').trim() : undefined, waiting_what: st === 'wait' ? fd.get('waiting_what') || 'reply' : undefined };
+          closeSheet(true); openChat(); toast(t('draftUpdated')); return;
+        }
         const tgt = (x && taskById(x.id)) || v;
         const prevDue = tgt.due || null, prevSt = tgt.status;
         tgt.title = title; tgt.details = (fd.get('details') || '').trim();
@@ -1478,6 +1774,7 @@ function openTaskForm(x, pre = null) {
         tgt.recur = recur;
         if (fd.get('status')) tgt.status = fd.get('status');
         tgt.role = role; tgt.project = (fd.get('project') || '').trim();
+        if (f.elements.unit) tgt.unit_id = unitById(f.elements.unit.value) ? f.elements.unit.value : null;
         tgt.source = !srcRaw || /^(أنا|انا|me|self)$/i.test(srcRaw) || srcRaw === t('srcSelf') ? SELF : srcRaw;
         tgt.steps_total = Math.max(0, Math.min(50, parseInt(fd.get('steps_total') || '0', 10) || 0)); tgt.steps_done = Math.min(tgt.steps_done || 0, tgt.steps_total);
         tgt.notes = (fd.get('notes') || '').trim();
@@ -1489,7 +1786,6 @@ function openTaskForm(x, pre = null) {
         });
         if (isNew) addLog(tgt, 'created'); else { if (prevSt !== tgt.status) addLog(tgt, 'status', '', { from: prevSt, to: tgt.status }); if (prevDue !== tgt.due) addLog(tgt, 'due', '', { from: prevDue, to: tgt.due }); }
         putTask(tgt); closeSheet(true); toast(t('saved'));
-        if (pre?.draftId) { CH.drafts = CH.drafts.filter(d => d.id !== pre.draftId); if (CH.drafts.length) return openChat(); }
         if (isNew) openTask(tgt.id);
       };
     }
@@ -1515,7 +1811,8 @@ function openLogForm(x, pre = null) {
         : `<button type="button" class="btn sm" data-act="connectdrive">${sic('folder', 16)}${t('driveForFiles')}</button>`}</div>`}
       <datalist id="projList">${projects.map(p => `<option value="${esc(p)}"></option>`).join('')}</datalist>
       <p class="note err-txt" id="formErr" hidden></p>
-      <div class="save-row sticky"><button type="submit" class="btn primary block">${ic.check}${t('save')}</button></div>
+      <div class="save-row sticky"><button type="submit" class="btn primary block">${ic.check}${isDraft ? t('draftApply') : t('save')}</button></div>
+      ${isDraft ? `<p class="note">${t('draftApplyNote')}</p>` : ''}
     </form>`, {
     onMount: sh => {
       const f = sh.querySelector('#logForm');
@@ -1697,11 +1994,290 @@ window.addEventListener('hashchange', routeHash);
 if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', e => { const id = e.data && e.data.openTask; if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return; if (taskById(id)) { closeAllLayers(); openTask(id); } else history.replaceState(null, '', location.pathname + location.search + '#t=' + id); });
 
 /* ---------- people ---------- */
+/* ---------- departments & sections ---------- */
+function openOrg() {
+  pushLayer(() => {
+    const ds = depts(), open = live().filter(x => isOpen(x) && !x.archived);
+    const cnt = ids => { const set = new Set(ids); const ts = open.filter(x => set.has(x.unit_id)); return { n: ts.length, late: ts.filter(isLate).length }; };
+    const ppl = people();
+    return topBar(t('orgTitle'), `<button type="button" class="btn sm primary" data-act="unitadd">${ic.plus}${t('addDept')}</button>`) + `<div class="layer-b">
+      <p class="note" style="margin-top:0">${t('orgIntro')}</p>
+      <div class="org-acts"><button type="button" class="btn sm" data-act="orgimport">${sic('clip', 15)}${t('orgImportBtn')}</button><button type="button" class="btn sm ghost" data-act="chat">${sic('spark', 15)}${t('orgByChat')}</button></div>
+      ${ds.length ? ds.map(d => { const secs = secsOf(d.id), c = cnt([d.id, ...secs.map(sc => sc.id)]); return `<section class="org-card">
+        <div class="org-h"><button type="button" class="org-name" data-unitf="${d.id}"><span class="mi">${ic.org}</span><b dir="auto">${esc(d.name)}</b></button>${c.n ? `<span class="pill ${c.late ? 'late' : 'prog'}">${plural(c.n, 'openTasks')}${c.late ? ` · ${t('nLate', { n: c.late })}` : ''}</span>` : ''}<button type="button" class="iconbtn sm" data-act="unitedit" data-u="${d.id}" aria-label="${esc(t('edit'))}">${sic('edit', 16)}</button></div>
+        <div class="org-secs">${secs.map(sc => { const c2 = cnt([sc.id]); return `<div class="org-sec"><button type="button" class="grow linkbtn inl" data-unitf="${sc.id}" dir="auto">↳ ${esc(sc.name)}</button>${c2.n ? `<span class="num muted">${c2.n}</span>` : ''}<button type="button" class="iconbtn sm" data-act="unitedit" data-u="${sc.id}" aria-label="${esc(t('edit'))}">${sic('edit', 15)}</button></div>`; }).join('')}
+          <button type="button" class="linkbtn inl" data-act="unitadd" data-parent="${d.id}">${sic('plus', 14)} ${t('addSec')}</button></div></section>`; }).join('')
+      : emptyBox(t('orgEmptyTitle'), t('orgEmptyText'), `<button type="button" class="btn primary" data-act="unitadd">${ic.plus}${t('addDept')}</button>`)}
+      ${ds.length && ppl.length ? `<div class="sec-h"><h3>${t('orgPeople')}</h3><span class="cnt">${ppl.filter(p => unitById(p.unit_id)).length}/${ppl.length}</span></div><p class="note" style="margin-top:0">${t('orgPeopleHint')}</p>
+        <div class="box org-ppl">${ppl.map(p => `<label class="org-p"><span class="av sm">${esc(initials(p.name))}</span><span class="grow" dir="auto">${esc(p.name)}</span>${unitSelect('pu_' + p.id, unitById(p.unit_id) ? p.unit_id : '', t('noUnitShort')).replace('<select ', `<select data-pu="${p.id}" `)}</label>`).join('')}</div>` : ''}
+    </div>`;
+  });
+}
+function openUnitForm(u, parentId) {
+  const isNew = !u, kind = u ? u.kind : parentId ? 'sec' : 'dept';
+  const ttl = isNew ? t(kind === 'sec' ? 'addSec' : 'addDept') : t(kind === 'sec' ? 'editSec' : 'editDept');
+  openSheet(ttl, `<form id="uForm" class="form" autocomplete="off">
+      <label class="fld"><span>${t(kind === 'sec' ? 'secName' : 'deptName')}</span><input name="name" required maxlength="150" dir="auto" value="${esc(u?.name || '')}" placeholder="${esc(t(kind === 'sec' ? 'secPh' : 'deptPh'))}" autofocus></label>
+      ${kind === 'sec' ? `<label class="fld"><span>${t('secOf')}</span><select name="parent">${depts().map(d => `<option value="${d.id}" ${(u?.parent_id || parentId) === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></label>` : ''}
+      ${isNew && kind === 'dept' ? `<label class="fld"><span>${t('deptSecs')} <em>${t('optional')}</em></span><textarea name="secs" rows="3" dir="auto" placeholder="${esc(t('deptSecsPh'))}"></textarea></label>` : ''}
+      <p class="note warn-txt" id="uErr" hidden>${t('unitExists')}</p>
+      <div class="save-row"><button class="btn primary block" type="submit">${ic.check}${t('save')}</button></div>
+      ${isNew ? '' : `<div class="danger-row"><button type="button" class="btn sm ghost danger" id="uDel">${sic('archive', 16)}${t('unitRemove')}</button></div>`}</form>`, {
+    onMount: sh => {
+      const f = sh.querySelector('#uForm');
+      f.onsubmit = e => {
+        e.preventDefault();
+        const name = String(f.elements.name.value || '').replace(/\s+/g, ' ').trim(); if (!name) return;
+        const parent = kind === 'sec' ? f.elements.parent.value : null;
+        if (units().some(x => x.id !== u?.id && x.kind === kind && (kind === 'dept' || x.parent_id === parent) && normAr(x.name) === normAr(name))) { sh.querySelector('#uErr').hidden = false; return; }
+        const tg = u ? unitById(u.id) : newUnit({ kind, parent_id: parent, sort: units().length });
+        tg.name = name.slice(0, 150); if (kind === 'sec') tg.parent_id = parent; putUnit(tg);
+        if (isNew && kind === 'dept') addSecs(tg.id, String(f.elements.secs?.value || '').split(/[\n،,؛;]+/));
+        closeSheet(true); toast(t('saved'));
+      };
+      sh.querySelector('#uDel')?.addEventListener('click', () => confirmSheet(t(kind === 'dept' ? 'deptRemoveQ' : 'secRemoveQ', { n: esc(u.name) }), t('unitRemove'), () => {
+        const tg = unitById(u.id); if (!tg) return; tg.deleted = true; putUnit(tg);
+        if (kind === 'dept') secsOf(tg.id).forEach(sc => { const y = unitById(sc.id); y.deleted = true; putUnit(y); });
+        if (UI.unitF === tg.id) UI.unitF = null; closeSheet(true); toast(t('unitRemoved'));
+      }));
+    }
+  });
+  sheetState.guard = true;
+}
+/** Adds sections under a department, skipping blanks and names it already has. Returns how many were added. */
+function addSecs(deptId, names) {
+  let n = 0;
+  names.map(x => String(x || '').replace(/\s+/g, ' ').trim()).filter(Boolean).forEach(nm => {
+    if (secsOf(deptId).some(sc => normAr(sc.name) === normAr(nm))) return;
+    putUnit(newUnit({ kind: 'sec', parent_id: deptId, name: nm.slice(0, 150), sort: units().length })); n++;
+  });
+  return n;
+}
+/** A department by name (created when missing). */
+function ensureDept(name) {
+  const nm = String(name || '').replace(/\s+/g, ' ').trim(); if (!nm) return null;
+  const hit = depts().find(d => normAr(d.name) === normAr(nm)); if (hit) return hit.id;
+  const u = newUnit({ kind: 'dept', name: nm.slice(0, 150), sort: units().length }); putUnit(u); return u.id;
+}
+/* ---------- Excel import: a tasks sheet (e.g. exported from the company portal) or a departments sheet ----------
+   Read on the device; nothing is saved before the review screen is approved. Re-importing the same portal sheet updates
+   the tasks it created (by the portal's task number) and never overwrites a field the user changed in Rafeeq since. */
+const HDR = [
+  ['ref', /^(رقم المهمه|رقم|الرقم|م|مسلسل|id|#|no|task id|task no)$/],
+  ['due', /(تاريخ الاستحقاق|الاستحقاق|تاريخ التسليم|موعد التسليم|الموعد النهائي|^الموعد$|due|deadline)/],
+  ['start', /(تاريخ البدء|تاريخ البدايه|start)/],
+  ['created', /(تاريخ الانشاء|created)/],
+  ['closed', /(تاريخ الاغلاق|تاريخ الانجاز|closed|completed on|completion)/],
+  ['pct', /(نسبه الانجاز|نسبه|progress|percent|%)/],
+  ['title', /(اسم المهمه|^المهمه$|^المهام$|عنوان|الموضوع|^task$|task name|^title$|subject|^المطلوب$)/],
+  ['desc', /(الوصف|التفاصيل|description|details)/],
+  ['status', /(الحاله|status)/],
+  ['prio', /(الاولويه|priority)/],
+  ['assignees', /(المسند لهم|المسند اليه|المسند|المكلف|المسؤول|assignee|assigned)/],
+  ['owner', /(المالك|المنشئ|صاحب المهمه|owner|created by|reporter)/],
+  ['project', /(المشروع|project)/],
+  ['channel', /^(المصدر|مصدر|source|channel)$/],
+  ['tags', /(الوسوم|الوسم|tags|labels)/],
+  ['dept', /^(الاداره|اداره|الادارات|department|dept)$/],
+  ['sec', /^(القسم|قسم|الاقسام|section)$/],
+  ['person', /^(الموظف|الموظفين|الاسم|اسم الموظف|الشخص|employee|name|person)$/],
+];
+function sheetCols(rows) {
+  for (let r = 0; r < Math.min(rows.length, 6); r++) {
+    const cols = {}; let hits = 0;
+    rows[r].forEach((h, i) => { const n = normAr(String(h || '')).replace(/[:*]/g, '').replace(/\s+/g, ' ').trim(); if (!n) return; const k = HDR.find(([key, rx]) => cols[key] == null && rx.test(n)); if (k) { cols[k[0]] = i; hits++; } });
+    if (hits >= 2 || cols.title != null || cols.dept != null) return { cols, head: r };
+  }
+  return null;
+}
+const cleanHTML = v => String(v ?? '').replace(/<br\s*\/?>/gi, '\n').replace(/<\/(p|div|li)>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\*\*/g, '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
+function cellDate(v) {
+  if (typeof v === 'number') return serialDate(v);
+  const s2 = String(v || '').trim(); let m;
+  if ((m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s2))) return validDate(`${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`);
+  if ((m = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})/.exec(s2))) return validDate(`${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`);
+  return null;
+}
+const splitNames = v => String(v || '').split(/[,،;؛\n]+/).map(x => x.replace(/\s+/g, ' ').trim()).filter(Boolean);
+const PORTAL_ST = [[/(مكتمل|منجز|منتهي|مغلق|اغلق|تم|done|complete|closed)/, 'done'], [/(ملغ|cancel)/, 'cancelled'], [/(مراجع|review)/, 'review'], [/(قيد التنفيذ|جار|جاري|in progress|progress|doing)/, 'prog'], [/(معلق|متوقف|hold|paused)/, 'hold'], [/(انتظار|بانتظار|waiting)/, 'prog'], [/(جديد|لم تبدا|لم يبدا|new|todo|open|not started)/, 'todo']];
+function portalStatus(v, pct) { const n = normAr(String(v || '')); if (/(متاخر|overdue|late)/.test(n)) return pct > 0 ? 'prog' : 'todo'; const hit = PORTAL_ST.find(([rx]) => rx.test(n)); return hit ? hit[1] : pct >= 100 ? 'review' : pct > 0 ? 'prog' : 'todo'; }
+function portalPrio(v) { const n = normAr(String(v || '')); return /(عاجل|حرج|urgent|critical)/.test(n) ? ['hi', true] : /(عالي|مرتفع|high)/.test(n) ? ['hi', false] : /(منخفض|low)/.test(n) ? ['lo', false] : ['mid', false]; }
+/** A person from a sheet: the exact contact, or one whose name is contained in it («مأمون الصقور» ⊂ «مامون محمود هزاع الصقور»). */
+function matchPersonLoose(name) {
+  const id = matchPerson(name); if (id) return id;
+  const tk = nameTokens(name); if (tk.length < 2) return null;
+  const hits = people().filter(p => { const pt = nameTokens(p.name); return pt.length >= 2 && pt[0] === tk[0] && pt.every(w => tk.includes(w)); });
+  return hits.length === 1 ? hits[0].id : null;
+}
+/** Department names written in a portal tag («إدارة تقنية المعلومات CEO» → «إدارة تقنية المعلومات»). */
+const tagUnits = v => splitNames(v).map(x => x.replace(/\s+(ceo|coo|cfo|[A-Z]{2,5})$/i, '').trim()).filter(x => /^(اداره|قسم|قطاع|department|section)\s/.test(normAr(x))); // «قرار الإدارة التنفيذية» is a tag, not a department
+function sheetKind(rows) { const sc = sheetCols(rows); if (!sc) return null; const c = sc.cols; return c.title != null ? 'tasks' : c.dept != null || c.sec != null ? 'org' : null; }
+
+async function importSheetFile(file, from = 'chat') {
+  let sh; try { sh = await readSheet(file); } catch (e) { const m = String(e?.message || ''); toast(t(m === 'unsupported' ? 'impUnsupported' : m === 'old_browser' ? 'impOldBrowser' : m === 'empty' ? 'impEmpty' : 'impBad'), null, 'err', 6000); return; }
+  const kind = sheetKind(sh.rows);
+  if (!kind) { const heads = (sh.rows[0] || []).filter(Boolean).slice(0, 8).join('، '); if ($('#chatLog')) { CH.msgs.push({ who: 'bot', html: `<span>${t('impUnknown', { h: esc(heads) })}</span>` }); renderChat(); } else toast(t('impUnknown', { h: heads }), null, 'err', 8000); return; }
+  if (kind === 'org' && !orgOn()) { toast(t('orgNeedsDb'), null, 'err', 6000); return; }
+  if ($('#chatLog')) { CH.msgs.push({ who: 'me', html: `<span class="filemsg">${sic('clip', 14)} <span dir="auto">${esc(file.name)}</span></span>` }); CH.msgs.push({ who: 'bot', html: `<span>${t(kind === 'tasks' ? 'impReadTasks' : 'impReadOrg', { n: sh.rows.length - 1 })}</span>` }); renderChat(); }
+  const fromChat = !!$('#chatLog'); if (fromChat) closeSheet(true); // the review screen opens full-size; the chat comes back with the result
+  const lr = kind === 'tasks' ? openTaskImport(sh, file.name) : openOrgImport(sh, file.name);
+  if (lr && fromChat) lr.onPop = () => openChat();
+}
+
+/* --- tasks --- */
+function parseTaskRows(sh) {
+  const { cols: c, head } = sheetCols(sh.rows); const get = (r, k) => c[k] != null ? r[c[k]] : '';
+  return sh.rows.slice(head + 1).map((r, i) => {
+    const title = cleanHTML(get(r, 'title')).replace(/\s+/g, ' ').slice(0, 300); if (!title) return null;
+    const pctRaw = get(r, 'pct'); const pct = pctRaw === '' ? null : Math.max(0, Math.min(100, Math.round(typeof pctRaw === 'number' && pctRaw <= 1 && String(pctRaw).includes('.') ? pctRaw * 100 : parseFloat(String(pctRaw).replace('%', '')) || 0)));
+    const desc = cleanHTML(get(r, 'desc')); const [prio, urgent] = portalPrio(get(r, 'prio'));
+    const project = String(get(r, 'project') || '').trim();
+    return { row: i, ref: String(get(r, 'ref') ?? '').trim().slice(0, 100), title, details: desc && normAr(desc) !== normAr(title) ? desc.slice(0, 5000) : '', status: portalStatus(get(r, 'status'), pct || 0), statusTxt: String(get(r, 'status') || '').trim(), priority: prio, urgent,
+      due: cellDate(get(r, 'due')), closed: cellDate(get(r, 'closed')), progress: c.pct != null ? pct : null, project: /^(غير محدد|بدون|none|-|n\/a)?$/i.test(normAr(project)) ? '' : project.slice(0, 80),
+      channel: String(get(r, 'channel') || '').trim().slice(0, 60), units: [...tagUnits(get(r, 'tags')), ...[get(r, 'dept'), get(r, 'sec')].map(x => String(x || '').trim()).filter(Boolean)], owner: String(get(r, 'owner') || '').replace(/\s+/g, ' ').trim(), assignees: splitNames(get(r, 'assignees')) };
+  }).filter(Boolean);
+}
+/** Who the user is in the sheet: a saved answer, else the name that matches the profile name, else the most frequent name. */
+function guessMe(items) {
+  const freq = new Map(); items.forEach(it => [it.owner, ...it.assignees].filter(Boolean).forEach(n => freq.set(n, (freq.get(n) || 0) + 1)));
+  const names = [...freq.keys()]; const saved = (state.profile.settings || {}).portalName;
+  if (saved && names.some(n => normAr(n) === normAr(saved))) return { me: names.find(n => normAr(n) === normAr(saved)), names, freq };
+  const mine = nameTokens(state.profile.display_name || '');
+  const scored = names.map(n => { const tk = nameTokens(n); const hit = mine.filter(w => tk.includes(w)).length; return [n, hit && tk[0] === mine[0] ? hit + 1 : hit, freq.get(n)]; }).sort((a, b) => b[1] - a[1] || b[2] - a[2]);
+  const top = scored[0];
+  const me = top && top[1] >= 2 ? top[0] : names.sort((a, b) => freq.get(b) - freq.get(a)).find(n => freq.get(n) >= Math.max(2, items.length * 0.5)) || '';
+  return { me, names: names.sort((a, b) => freq.get(b) - freq.get(a)), freq };
+}
+/** What one sheet row becomes, given who the user is. */
+function planTask(it, me) {
+  const isMe = n => !!me && normAr(n) === normAr(me);
+  const mine = it.assignees.some(isMe), byMe = isMe(it.owner) || (!it.owner && mine);
+  const others = it.assignees.filter(n => !isMe(n));
+  let role = byMe ? (mine ? (others.length ? 'both' : 'exec') : 'follow') : mine ? 'exec' : 'follow';
+  const fus = role === 'exec' ? [] : others.slice(0, 12);
+  if (!fus.length && role !== 'exec') role = 'exec'; // nobody to follow up with
+  const source = byMe ? SELF : it.owner ? srcName(it.owner) : null;
+  let unit = null, newUnitName = '';
+  for (const u of it.units) { const id = matchUnit(u, true) || depts().find(d => normAr(d.name) === normAr(u))?.id; if (id) { unit = id; break; } if (!newUnitName) newUnitName = u; }
+  if (unit) newUnitName = '';
+  if (!unit && !newUnitName) { const ids = [...new Set(fus.map(n => unitOfPerson(matchPersonLoose(n))).filter(Boolean))]; if (ids.length === 1) unit = ids[0]; }
+  if (!unit && !newUnitName) unit = matchUnit(it.title + ' ' + it.details.slice(0, 300), true);
+  const cos = role === 'exec' ? others : [];
+  return { ...it, role, fus, source, unit, newUnitName, cos };
+}
+const TRACK = ['title', 'status', 'due', 'priority', 'progress'];
+function importDiff(x, p) {
+  const was = x.ai?.portal || {}; const ch = []; const kept = [];
+  TRACK.forEach(k => { const nv = k === 'status' ? (p.status === 'done' ? 'done' : p.status) : p[k] ?? null; const cur = x[k] ?? null; if (nv === (was[k] ?? null) || nv === cur) return; if ((was[k] ?? null) !== cur && was[k] !== undefined) kept.push(k); else ch.push(k); });
+  return { ch, kept };
+}
+function openTaskImport(sh, fname) {
+  const items = parseTaskRows(sh); if (!items.length) { toast(t('impEmpty'), null, 'err'); return null; }
+  const g = guessMe(items);
+  const S = { me: g.me, names: g.names, sel: new Set(), newUnits: new Set(), grp: 'unit', fname };
+  const byRef = new Map(live().filter(x => x.ext_ref).map(x => [x.ext_ref, x]));
+  const dupOf = p => p.ref ? byRef.get(p.ref) : live().find(x => !x.ext_ref && normAr(x.title) === normAr(p.title) && (x.due || null) === (p.due || null));
+  const plan = () => items.map(it => { const p = planTask(it, S.me); const ex = dupOf(p); const d = ex ? importDiff(ex, p) : null; return { ...p, ex, d, kind: !ex ? 'new' : d.ch.length ? 'upd' : 'same' }; });
+  let P = plan(); P.forEach((p, i) => { if (p.kind !== 'same') S.sel.add(i); if (p.newUnitName) S.newUnits.add(p.newUnitName); });
+  S.layer = pushLayer(() => {
+    const cN = P.filter(p => p.kind === 'new').length, cU = P.filter(p => p.kind === 'upd').length, cS = P.filter(p => p.kind === 'same').length;
+    const newU = [...new Set(P.map(p => p.newUnitName).filter(Boolean))];
+    const gk = p => S.grp === 'status' ? p.status : (p.unit ? deptOf(p.unit)?.id : p.newUnitName && S.newUnits.has(p.newUnitName) ? 'new:' + p.newUnitName : '-');
+    const gl = k => S.grp === 'status' ? t(stKey(k)) : k === '-' ? t('noUnit') : k.startsWith('new:') ? `${k.slice(4)} <em class="newb">${t('newBadge')}</em>` : esc(unitById(k)?.name || '');
+    const groups = new Map(); P.forEach((p, i) => { const k = gk(p); if (!groups.has(k)) groups.set(k, []); groups.get(k).push([p, i]); });
+    const row = ([p, i]) => `<label class="imp-row ${p.kind}"><input type="checkbox" data-imp="${i}" ${S.sel.has(i) ? 'checked' : ''}><span class="body"><span class="t" dir="auto">${esc(p.title)}</span><span class="meta"><span class="pill ${{ prog: 'prog', wait: 'wait', review: 'review', done: 'done' }[p.status] || ''}">${t(stKey(p.status))}</span>${p.due ? `<span class="${p.status !== 'done' && p.status !== 'review' && p.due < T() ? 'late-txt' : ''}">${fmtShort(p.due)}</span>` : ''}${p.priority === 'hi' ? `<span class="pill hi">${t(p.urgent ? 'urgentPill' : 'prioHi')}</span>` : ''}${p.progress && p.status !== 'done' ? `<span class="num">${p.progress}%</span>` : ''}<span>${t('role_' + p.role)}</span>${p.fus.length ? `<span dir="auto">${sic('users', 12)} ${esc(p.fus.slice(0, 2).map(n => n.split(' ')[0]).join('، '))}${p.fus.length > 2 ? ` +${p.fus.length - 2}` : ''}</span>` : ''}${p.source && p.source !== SELF ? `<span dir="auto">${t('srcShort')}: ${esc(p.source)}</span>` : ''}${p.unit && S.grp === 'status' ? `<span>${esc(unitLabel(p.unit, true))}</span>` : p.unit && deptOf(p.unit)?.id !== p.unit ? `<span>↳ ${esc(unitLabel(p.unit, true))}</span>` : ''}</span>
+      ${p.kind === 'upd' ? `<span class="imp-upd">${t('impWillUpdate', { f: p.d.ch.map(k => t('impF_' + k)).join('، ') })}${p.d.kept.length ? ` · ${t('impKept', { f: p.d.kept.map(k => t('impF_' + k)).join('، ') })}` : ''}</span>` : p.kind === 'same' ? `<span class="imp-upd muted">${t('impSame')}</span>` : ''}</span><span class="badge ${p.kind}">${t('impK_' + p.kind)}</span></label>`;
+    return topBar(t('impTitle')) + `<div class="layer-b imp">
+      <p class="note" style="margin-top:0" dir="auto">${sic('clip', 14)} ${esc(S.fname)} · ${t('impCounts', { a: cN, b: cU, c: cS })}</p>
+      <div class="box imp-me"><label class="fld"><span>${t('impWhoMe')}</span><select id="impMe"><option value="">${t('impMeNone')}</option>${S.names.slice(0, 40).map(n => `<option ${normAr(n) === normAr(S.me) ? 'selected' : ''}>${esc(n)}</option>`).join('')}</select></label><small class="note">${t('impWhoMeHint')}</small></div>
+      ${newU.length && orgOn() ? `<div class="box"><p class="impq">${t('impNewUnits')}</p>${newU.map(n => `<label class="imp-nu"><input type="checkbox" data-nu="${esc(n)}" ${S.newUnits.has(n) ? 'checked' : ''}> <span dir="auto">${esc(n)}</span></label>`).join('')}</div>` : ''}
+      <div class="imp-bar"><div class="seg two" role="tablist">${[['unit', 'impByUnit'], ['status', 'impByStatus']].map(([k, l]) => `<button type="button" class="${S.grp === k ? 'on' : ''}" data-impgrp="${k}">${t(l)}</button>`).join('')}</div><button type="button" class="linkbtn" data-impall="1">${S.sel.size === P.length ? t('impNone') : t('impAll')}</button></div>
+      ${[...groups].map(([k, rs]) => `<section class="imp-g"><div class="sec-h"><h3>${gl(k)}</h3><span class="cnt">${rs.length}</span></div><div class="box imp-list">${rs.map(row).join('')}</div></section>`).join('')}
+      <div class="save-row sticky"><button type="button" class="btn primary block" data-act="impgo" ${S.sel.size ? '' : 'disabled'}>${ic.check}${t('impGo', { n: S.sel.size })}</button></div>
+    </div>`;
+  });
+  const lr = S.layer;
+  lr.el.addEventListener('change', e => {
+    const tg = e.target;
+    if (tg.dataset.imp != null) { const i = +tg.dataset.imp; if (tg.checked) S.sel.add(i); else S.sel.delete(i); return lr.rerender(); }
+    if (tg.dataset.nu != null) { if (tg.checked) S.newUnits.add(tg.dataset.nu); else S.newUnits.delete(tg.dataset.nu); return lr.rerender(); }
+    if (tg.id === 'impMe') { S.me = tg.value; P = plan(); return lr.rerender(); }
+  });
+  lr.el.addEventListener('click', e => {
+    const b = e.target.closest('[data-impgrp],[data-impall],[data-act=impgo]'); if (!b) return; e.stopPropagation();
+    if (b.dataset.impgrp) { S.grp = b.dataset.impgrp; return lr.rerender(); }
+    if (b.dataset.impall) { if (S.sel.size === P.length) S.sel.clear(); else P.forEach((_, i) => S.sel.add(i)); return lr.rerender(); }
+    if (b.dataset.act === 'impgo') return runTaskImport(P, S);
+  });
+  return lr;
+}
+function runTaskImport(P, S) {
+  if (S.me) { const st = Object.assign({}, state.profile.settings); if (st.portalName !== S.me) { st.portalName = S.me; saveProfile({ settings: st }); } }
+  const made = { n: 0, u: 0, units: 0 }; const unitIds = new Map();
+  if (orgOn()) [...S.newUnits].forEach(n => { const before = depts().length; const id = ensureDept(n); if (id) { unitIds.set(n, id); if (depts().length > before) made.units++; } });
+  [...S.sel].sort((a, b) => a - b).forEach(i => {
+    const p = P[i]; if (!p) return;
+    const unit = orgOn() ? (p.unit || unitIds.get(p.newUnitName) || null) : null;
+    const snap = { title: p.title, status: p.status, due: p.due, priority: p.priority, progress: p.progress };
+    if (p.ex) {
+      const x = taskById(p.ex.id); if (!x) return;
+      p.d.ch.forEach(k => { if (k === 'status') { if (x.status !== p.status) { addLog(x, 'status', '', { from: x.status, to: p.status }); x.status = p.status; if (p.status === 'done') x.completed_on = p.closed || T(); else x.completed_on = null; } } else if (k === 'due') { addLog(x, 'due', '', { from: x.due, to: p.due }); x.due = p.due; } else x[k] = p[k]; });
+      if (unit && !x.unit_id) x.unit_id = unit;
+      x.ai = { ...(x.ai || {}), portal: snap }; addLog(x, 'imported', S.fname.slice(0, 80)); putTask(x); made.u++; return;
+    }
+    const notes = [p.urgent ? t('impUrgentNote') : '', p.channel ? t('impChannelNote', { c: p.channel }) : '', p.cos.length ? t('impCoNote', { n: p.cos.join('، ') }) : ''].filter(Boolean).join('\n');
+    const x = newTask({ title: p.title, details: p.details, status: p.status, priority: p.priority, role: p.role, due: p.due, source: p.source || '', project: p.project, notes, progress: p.progress, ext_ref: p.ref, unit_id: unit, completed_on: p.status === 'done' ? (p.closed || T()) : null, ai: { portal: snap } });
+    if (x.status === 'wait') x.status = 'prog'; // the sheet does not say on whom
+    addLog(x, 'imported', S.fname.slice(0, 80));
+    const due = x.due && x.due > T() ? (diffDays(x.due, T()) > 1 ? addWorkdays(x.due, -1) : x.due) : addWorkdays(T(), 1);
+    p.fus.forEach(n => { const pid = matchPersonLoose(n) || getOrCreatePerson(n); if (!pid || x.followups.some(f => f.person_id === pid)) return; x.followups.push({ id: uuid(), person_id: pid, what: '', due, status: isOpen(x) ? 'open' : 'done', created_at: nowISO(), closed_on: isOpen(x) ? null : T(), log: [] }); });
+    putTask(x); made.n++;
+  });
+  popLayer();
+  const msg = t('impDone', { a: made.n, b: made.u }) + (made.units ? ' ' + t('impDoneUnits', { n: made.units }) : '');
+  toast(msg);
+  { CH.msgs.push({ who: 'bot', html: `${sic('check', 16)} <span>${msg}</span><div class="chips"><button type="button" class="chip" data-tab="tasks">${t('navTasks')}</button>${orgOn() && depts().length ? `<button type="button" class="chip" data-act="org">${t('orgTitle')}</button>` : ''}</div>` }); renderChat(); }
+}
+
+/* --- departments sheet: columns Department / Section / (optional) Person --- */
+function openOrgImport(sh, fname) {
+  const { cols: c, head } = sheetCols(sh.rows); const get = (r, k) => c[k] != null ? String(r[c[k]] ?? '').replace(/\s+/g, ' ').trim() : '';
+  let lastD = '';
+  const rows = sh.rows.slice(head + 1).map(r => { let d = get(r, 'dept'); const sc = get(r, 'sec'), pn = get(r, 'person'); if (!d && sc) d = lastD; if (d) lastD = d; return d ? { d, sc, pn } : null; }).filter(Boolean);
+  if (!rows.length) { toast(t('impEmpty'), null, 'err'); return null; }
+  const tree = new Map(); rows.forEach(r => { if (!tree.has(r.d)) tree.set(r.d, { secs: new Set(), ppl: [] }); const n = tree.get(r.d); if (r.sc) n.secs.add(r.sc); if (r.pn) splitNames(r.pn).forEach(x => n.ppl.push([x, r.sc])); });
+  const exD = d => depts().find(x => normAr(x.name) === normAr(d));
+  pushLayer(() => topBar(t('impOrgTitle')) + `<div class="layer-b imp">
+    <p class="note" style="margin-top:0" dir="auto">${sic('clip', 14)} ${esc(fname)}</p>
+    ${[...tree].map(([d, n]) => { const ed = exD(d); return `<section class="org-card"><div class="org-h"><span class="mi">${ic.org}</span><b class="grow" dir="auto">${esc(d)}</b><span class="badge ${ed ? 'same' : 'new'}">${t(ed ? 'impK_same' : 'impK_new')}</span></div>
+      ${n.secs.size ? `<div class="org-secs">${[...n.secs].map(sc => `<div class="org-sec"><span class="grow" dir="auto">↳ ${esc(sc)}</span>${ed && secsOf(ed.id).some(x => normAr(x.name) === normAr(sc)) ? '' : `<span class="badge new">${t('impK_new')}</span>`}</div>`).join('')}</div>` : ''}
+      ${n.ppl.length ? `<p class="note" dir="auto">${sic('users', 13)} ${esc(n.ppl.map(([pn]) => pn).slice(0, 12).join('، '))}${n.ppl.length > 12 ? ` +${n.ppl.length - 12}` : ''}</p>` : ''}</section>`; }).join('')}
+    <div class="save-row sticky"><button type="button" class="btn primary block" id="orgGo">${ic.check}${t('impOrgGo', { d: tree.size })}</button></div></div>`);
+  const lr = UI.layers[UI.layers.length - 1];
+  lr.el.addEventListener('click', e => {
+    if (!e.target.closest('#orgGo')) return; e.stopPropagation();
+    let nd = 0, ns = 0, np = 0;
+    tree.forEach((n, d) => {
+      const before = depts().length; const did = ensureDept(d); if (depts().length > before) nd++;
+      ns += addSecs(did, [...n.secs]);
+      n.ppl.forEach(([pn, sc]) => { const pid = matchPersonLoose(pn) || getOrCreatePerson(pn); const p = personById(pid); if (!p) return; const sid = sc ? secsOf(did).find(x => normAr(x.name) === normAr(sc))?.id : null; p.unit_id = sid || did; putPerson(p); np++; });
+    });
+    popLayer(); const msg = t('impOrgDone', { d: nd, s: ns, p: np }); toast(msg);
+    CH.msgs.push({ who: 'bot', html: `${sic('check', 16)} <span>${msg}</span>` }); if ($('#chatLog')) renderChat();
+  });
+  return lr;
+}
+function pickSheet() {
+  let inp = $('#sheetFile'); if (!inp) { inp = document.createElement('input'); inp.type = 'file'; inp.id = 'sheetFile'; inp.hidden = true; inp.accept = '.xlsx,.xlsm,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv'; document.body.appendChild(inp); inp.addEventListener('change', () => { const f = inp.files?.[0]; inp.value = ''; if (f) importSheetFile(f); }); }
+  inp.click();
+}
+
 function openPersonForm(p) {
   const isNew = !p;
   openSheet(isNew ? t('addPerson') : t('editPerson'), `<form id="pForm" class="form" autocomplete="off">
       <label class="fld"><span>${t('pName')}</span><input name="name" required maxlength="120" dir="auto" value="${esc(p?.name || '')}" autofocus></label>
       <label class="fld"><span>${t('pOrg')} <em>${t('optional')}</em></span><input name="org" dir="auto" value="${esc(p?.org || '')}" placeholder="${esc(t('pOrgPh'))}"></label>
+      ${orgOn() && depts().length ? `<label class="fld"><span>${sic('org', 14)} ${t('fUnit')} <em>${t('optional')}</em></span>${unitSelect('unit', p?.unit_id || '')}<small class="note">${t('pUnitHint')}</small></label>` : ''}
       <label class="fld"><span>${t('pContact')} <em>${t('optional')}</em></span><input name="contact" dir="auto" value="${esc(p?.contact || '')}" placeholder="${esc(t('pContactPh'))}"></label>
       <label class="fld"><span>${t('pNotes')} <em>${t('optional')}</em></span><textarea name="notes" rows="2" dir="auto">${esc(p?.notes || '')}</textarea></label>
       <p class="note warn-txt" id="pErr" hidden>${t('nameExists')}</p>
@@ -1712,6 +2288,7 @@ function openPersonForm(p) {
       if (people().some(q => q.id !== p?.id && nameTokens(q.name).join(' ') === key)) { sh.querySelector('#pErr').hidden = false; return; }
       const tg = (p && (personById(p.id) || p)) || newPerson(name);
       tg.name = name; tg.org = (fd.get('org') || '').trim(); tg.contact = (fd.get('contact') || '').trim(); tg.notes = (fd.get('notes') || '').trim();
+      if (e.target.elements.unit) tg.unit_id = unitById(e.target.elements.unit.value) ? e.target.elements.unit.value : null;
       putPerson(tg); closeSheet(true); toast(t('saved')); if (isNew) openPerson(tg.id);
     }
   });
@@ -1752,6 +2329,7 @@ function pushLayer(build) {
 }
 function popLayer() {
   const Lr = UI.layers.pop(); if (!Lr) return;
+  if (Lr.onPop) setTimeout(Lr.onPop, 0);
   Lr.el.classList.remove('on'); setTimeout(() => Lr.el.remove(), 280);
   if (!UI.layers.length) $('#layerBackdrop').classList.remove('on');
   try { if (Lr.opener && Lr.opener.isConnected) Lr.opener.focus({ preventScroll: true }); } catch { }
@@ -1778,13 +2356,16 @@ function openTask(id) {
       <div class="kv num">
         <div><small>${t('fDue')}</small><b>${x.due ? `${wd(x.due)} ${fmtShort(x.due)}${x.due_time ? ` · <span class="num">${fmtTime(x.due_time)}</span>` : ''}` : t('noDue')}</b>${isLate(x) ? `<span class="pill late">${lateTxt(x.due)}</span>` : ''}</div>
         <div><small>${t('fRole')}</small><b>${t('role_' + x.role)}</b></div>
+        ${orgOn() && (unitOf(x) || depts().length) ? `<div class="wide"><small>${t('fUnit')}</small>${unitOf(x) ? `<button type="button" class="linkbtn inl" data-unitf="${unitOf(x).id}" dir="auto"><b>${sic('org', 14)} ${esc(unitLabel(x.unit_id))}</b></button>` : `<button type="button" class="linkbtn inl" data-act="edittask" data-id="${x.id}">${t('addUnit')}</button>`}</div>` : ''}
+        ${x.progress != null && isOpen(x) ? `<div class="wide"><small>${t('fProgress')}</small><b class="num">${x.progress}%</b><div class="progress"><i style="width:${x.progress}%"></i></div></div>` : ''}
+        ${x.ext_ref ? `<div><small>${t('fExtRef')}</small><b class="num" dir="ltr">${esc(x.ext_ref)}</b></div>` : ''}
         ${x.steps_total ? `<div class="wide"><small>${t('stepsDone')}</small><div class="stepper"><button type="button" class="iconbtn sm" data-act="stepminus" data-id="${x.id}" aria-label="−">${ic.minus}</button><b>${t('stepsOf', { a: x.steps_done, b: x.steps_total })}</b><button type="button" class="iconbtn sm" data-act="stepplus" data-id="${x.id}" aria-label="+">${ic.plus}</button></div><div class="progress"><i style="width:${pct}%"></i></div></div>` : ''}
         ${x.recur ? `<div class="wide"><small>${t('fRecur')}</small><b>${sic('repeat', 14)} ${recurLabel(x.recur)}</b>${open ? ` <button type="button" class="linkbtn inl" data-act="skiprec" data-id="${x.id}">${t('skipOnce')}</button>` : ''}</div>` : ''}
         ${x.due_time && open ? `<div><small>${t('fRemind')}</small><b>${remindLabel(x.remind_min)}</b></div>` : ''}
         ${x.source ? `<div><small>${t('fSource')}</small><b dir="auto">${esc(srcLabel(x.source))}</b></div>` : `<div><small>${t('fSource')}</small><button type="button" class="linkbtn inl" data-act="edittask" data-id="${x.id}">${t('addSource')}</button></div>`}
       </div>
       ${open ? `<div class="save-row"><button type="button" class="btn primary block" data-act="complete" data-id="${x.id}">${ic.check}${t('complete')}</button><button type="button" class="btn block" data-act="postpone" data-id="${x.id}">${sic('later', 18)}${t('postpone')}</button></div>
-        <div class="st-row">${['todo', 'prog', 'wait', 'hold'].map(s => `<button type="button" class="chip ${x.status === s ? 'on' : ''}" data-act="setst" data-id="${x.id}" data-v="${s}">${t(stKey(s))}</button>`).join('')}</div>` : `<div class="save-row"><button type="button" class="btn block" data-act="reopen" data-id="${x.id}">${sic('reopen', 18)}${t('reopen')}</button></div>`}
+        <div class="st-row">${OPEN_ST().map(s => `<button type="button" class="chip ${x.status === s ? 'on' : ''}" data-act="setst" data-id="${x.id}" data-v="${s}">${t(stKey(s))}</button>`).join('')}</div>` : `<div class="save-row"><button type="button" class="btn block" data-act="reopen" data-id="${x.id}">${sic('reopen', 18)}${t('reopen')}</button></div>`}
       <div class="sec-h"><h3>${t('followups')}</h3><span class="cnt">${openFus(x).length}</span><span class="grow"></span><button type="button" class="btn sm ghost" data-act="addfu" data-id="${x.id}">${sic('plus', 16)}${t('add')}</button></div>
       <div class="box">${fus.length ? fus.map(f => `<div class="fu ${f.status !== 'open' ? 'closed' : ''}"><div class="fu-top"><span class="av">${esc(initials(pname(f.person_id)))}</span><div class="body"><div class="t" dir="auto">${esc(pname(f.person_id))}</div><div class="meta">${f.what ? `<span dir="auto">${esc(f.what)}</span>` : ''}${f.status === 'open' ? `<span class="pill ${fuLate(f) ? 'late' : f.due <= T() ? 'wait' : ''}">${fuLate(f) ? lateTxt(f.due) : rel(f.due)}${f.time ? ' · ' + fmtTime(f.time) : ''}</span>` : `<span class="pill done">${t('fuClosed', { d: fmtShort(f.closed_on || T()) })}</span>`}</div></div>
           ${f.status === 'open' && open ? `<button type="button" class="iconbtn sm" data-act="remind" data-id="${x.id}" data-fu="${esc(f.id)}" aria-label="${esc(t('remind'))}" title="${esc(t('remind'))}">${sic('send', 17)}</button><button type="button" class="btn sm" data-act="furesult" data-id="${x.id}" data-fu="${esc(f.id)}">${t('logResult')}</button>` : ''}<button type="button" class="iconbtn sm" data-act="fumenu" data-id="${x.id}" data-fu="${esc(f.id)}" aria-label="${esc(t('edit'))}">${sic('edit', 16)}</button></div>
@@ -1823,7 +2404,7 @@ function openPerson(id) {
     hist.sort((a, b) => (b.l.at || '') > (a.l.at || '') ? 1 : -1);
     const rel2 = sortTasks([...related].map(taskById).filter(x => x && isOpen(x)));
     return topBar(t('person'), `<button type="button" class="iconbtn" data-act="editperson" data-id="${p.id}" aria-label="${esc(t('edit'))}">${ic.edit}</button>`) + `<div class="layer-b">
-      <div class="p-head"><span class="av xl">${esc(initials(p.name))}</span><div><h2 class="d-title" dir="auto" style="margin:0">${esc(p.name)}</h2>${p.org ? `<div class="sub" dir="auto">${esc(p.org)}</div>` : ''}${p.contact ? `<div class="sub" dir="auto">${esc(p.contact)}</div>` : ''}</div></div>
+      <div class="p-head"><span class="av xl">${esc(initials(p.name))}</span><div><h2 class="d-title" dir="auto" style="margin:0">${esc(p.name)}</h2>${p.org ? `<div class="sub" dir="auto">${esc(p.org)}</div>` : ''}${orgOn() && unitById(p.unit_id) ? `<button type="button" class="linkbtn inl sub" data-unitf="${p.unit_id}" dir="auto">${sic('org', 13)} ${esc(unitLabel(p.unit_id))}</button>` : ''}${p.contact ? `<div class="sub" dir="auto">${esc(p.contact)}</div>` : ''}</div></div>
       ${p.contact && /\d{7,}/.test(p.contact) ? `<div class="row" style="margin:-4px 0 12px"><a class="btn sm" href="tel:${esc(p.contact.replace(/[^\d+]/g, ''))}">${sic('phone', 16)}${t('call')}</a><a class="btn sm" href="https://wa.me/${esc(waNumber(p.contact))}" target="_blank" rel="noopener">${sic('send', 16)}WhatsApp</a></div>` : ''}
       ${p.notes ? `<p class="d-text" dir="auto">${esc(p.notes)}</p>` : ''}
       ${openF.length ? sec(t('openFollowups'), openF.length, openF.map(([x, f]) => fuRow(x, f)).join('')) : ''}
@@ -1967,7 +2548,7 @@ async function loadShares(Lr) {
 
 /* ================= backup ================= */
 function exportBackup() {
-  const data = { app: 'rafeeq', version: 2, exported_at: nowISO(), profile: state.profile, people: state.people.filter(p => !p.deleted), tasks: state.tasks.filter(x => !x.deleted), files: state.files.filter(f => !f.deleted) };
+  const data = { app: 'rafeeq', version: 2, exported_at: nowISO(), profile: state.profile, people: state.people.filter(p => !p.deleted), tasks: state.tasks.filter(x => !x.deleted), files: state.files.filter(f => !f.deleted), units: (state.units || []).filter(u => !u.deleted) };
   const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `rafeeq-backup-${T()}.json`;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
@@ -1999,16 +2580,20 @@ async function importBackup(file) {
   const fu = f => ({ id: okId(f.id) ? f.id : uuid(), person_id: f.person_id, what: str(f.what, 300), due: validDate(f.due), time: hhmm(f.time), status: f.status === 'done' ? 'done' : 'open', created_at: iso(f.created_at), closed_on: validDate(f.closed_on), log: (Array.isArray(f.log) ? f.log : []).slice(0, 200).map(fuLog) });
   const tlog = e => ({ id: okId(e?.id) ? e.id : uuid(), at: iso(e?.at), kind: str(e?.kind, 20) || 'edited', text: str(e?.text, 2000), data: e?.data && typeof e.data === 'object' && !Array.isArray(e.data) ? e.data : {} });
   conv.tasks = conv.tasks.filter(x => x && okId(x.id) && typeof x.title === 'string').map(x => newTask({
-    ...x, kind: x.kind === 'log' ? 'log' : 'task', status: ['todo', 'prog', 'wait', 'hold', 'done', 'cancelled'].includes(x.status) ? x.status : 'todo', priority: ['hi', 'mid', 'lo'].includes(x.priority) ? x.priority : 'mid',
+    ...x, kind: x.kind === 'log' ? 'log' : 'task', status: ['todo', 'prog', 'wait', 'review', 'hold', 'done', 'cancelled'].includes(x.status) ? x.status : 'todo', priority: ['hi', 'mid', 'lo'].includes(x.priority) ? x.priority : 'mid',
     role: ['exec', 'follow', 'both'].includes(x.role) ? x.role : 'exec', waiting_what: ['reply', 'decision', 'approval'].includes(x.waiting_what) ? x.waiting_what : 'reply', waiting_on: okId(x.waiting_on) ? x.waiting_on : null,
     due: validDate(x.due), due_time: hhmm(x.due_time), remind_min: x.remind_min == null ? null : int(x.remind_min, -1, 1440, null), completed_on: validDate(x.completed_on), created_at: iso(x.created_at), client_ts: nowISO(),
     title: String(x.title).slice(0, 500), details: str(x.details, 20000), notes: str(x.notes, 20000), result: str(x.result, 5000), project: str(x.project, 200), source: str(x.source, 200),
     steps_done: int(x.steps_done, 0, 50, 0), steps_total: int(x.steps_total, 0, 50, 0), archived: !!x.archived, deleted: !!x.deleted, ai: {},
+    unit_id: okId(x.unit_id) ? x.unit_id : null, ext_ref: str(x.ext_ref, 100), progress: x.progress == null ? null : int(x.progress, 0, 100, null),
     followups: (Array.isArray(x.followups) ? x.followups : []).filter(f => f && okId(f.person_id)).slice(0, 100).map(fu), log: (Array.isArray(x.log) ? x.log : []).slice(0, 500).map(tlog), recur: cleanRecur(x.recur),
   }));
   conv.people = conv.people.filter(p => p && okId(p.id) && typeof p.name === 'string' && p.name.trim()).map(p => ({ ...newPerson(p.name.slice(0, 200)), id: p.id, org: str(p.org, 200), contact: str(p.contact, 200), notes: str(p.notes, 5000), deleted: !!p.deleted, created_at: iso(p.created_at) }));
   conv.files = (conv.files || []).filter(f => f && okId(f.id) && typeof f.name === 'string' && /^[\w-]{10,200}$/.test(f.drive_id || '')).map(f => newFile({ id: f.id, drive_id: f.drive_id, name: String(f.name).slice(0, 300), mime: str(f.mime, 100), size: int(f.size, 0, 1e12, 0), task_id: okId(f.task_id) ? f.task_id : null, person_id: okId(f.person_id) ? f.person_id : null, note: str(f.note, 1000), deleted: !!f.deleted, created_at: iso(f.created_at) }));
+  const unitsIn = d.version === 2 && Array.isArray(d.units) ? d.units.filter(u => u && okId(u.id) && typeof u.name === 'string' && u.name.trim()).slice(0, 500).map(u => newUnit({ id: u.id, name: u.name.slice(0, 150), kind: u.kind === 'sec' ? 'sec' : 'dept', parent_id: okId(u.parent_id) ? u.parent_id : null, sort: int(u.sort, 0, 100000, 0) })) : [];
+  conv.people.forEach(p => { const src = (d.people || []).find(q => q && q.id === p.id); p.unit_id = okId(src?.unit_id) ? src.unit_id : null; });
   confirmSheet(t('importQ', { t: plural(conv.tasks.length, 'tasks'), p: plural(conv.people.length, 'people') }), t('importAdd'), () => {
+    const haveU = new Set((state.units || []).map(u => u.id)); unitsIn.filter(u => !haveU.has(u.id)).forEach(u => putUnit(u));
     const haveT = new Set(state.tasks.map(x => x.id)), haveP = new Set(state.people.map(p => p.id));
     const tasks = state.tasks.concat(conv.tasks.filter(x => !haveT.has(x.id)));
     const ppl = state.people.concat(conv.people.filter(p => !haveP.has(p.id)));
@@ -2030,6 +2615,7 @@ document.addEventListener('click', async e => {
   if ((el = q('[data-proj]'))) { e.stopPropagation(); return openProject(el.dataset.proj); }
   if ((el = q('[data-pview]'))) { UI.pview = el.dataset.pview; return renderMain(); }
   if ((el = q('[data-pf]'))) { UI.personF = UI.personF === el.dataset.pf ? null : el.dataset.pf; return renderMain(); }
+  if ((el = q('[data-unitf]'))) { const v = el.dataset.unitf; UI.unitF = !el.dataset.sec && (UI.unitF === v || (el.closest('.unit-row') && deptOf(UI.unitF)?.id === v)) ? null : v; if (UI.tab !== 'tasks' || UI.layers.length) { UI.tview = 'cards'; UI.seg = 'active'; go('tasks'); } else renderMain(); return; }
   if ((el = q('[data-ltype]'))) { UI.ltype = el.dataset.ltype; return renderMain(); }
   if ((el = q('[data-file]'))) return openFile(el.dataset.file);
   if ((el = q('[data-person]')) && !q('[data-act]')) return openPerson(el.dataset.person);
@@ -2049,11 +2635,18 @@ document.addEventListener('click', async e => {
       case 'chatq': return chatSend(el.dataset.q, el.dataset.l);
       case 'chatsave': return saveDrafts();
       case 'draftadd': { const d = CH.drafts[+el.dataset.n], k = el.dataset.k; if (!d) return; CH.extra = CH.extra && CH.extra.id === d.id && CH.extra.k === k ? null : { id: d.id, k }; renderChat(); if (CH.extra) setTimeout(() => $('#chatIn')?.focus(), 50); return; }
+      case 'anssoft': { const sp = softPending(); if (!sp) return renderChat(); if (el.dataset.all) CH.drafts.filter(d => softOf(d) === sp.k).forEach(d => setSoft(d, sp.k, el.dataset.v)); else setSoft(sp.d, sp.k, el.dataset.v); return renderChat(); }
+      case 'actrun': return runActions();
+      case 'actdrop': CH.actions = null; botSay(t('actCancelled')); return renderChat();
+      case 'actpick': { const a = (CH.actions || [])[+el.dataset.i]; if (a) a.task = el.dataset.v; return renderChat(); }
+      case 'unitdept': UI.askUnitDept = el.dataset.v; return renderChat();
+      case 'unitback': UI.askUnitDept = null; return renderChat();
+      case 'skipsoft': { CH.drafts.forEach(d => { d.softSkip = true; }); return renderChat(); }
       case 'ansextra': { const e = extraOn(); if (e && !el.dataset.skip) { const d = CH.drafts[e.n]; if (e.k === 'time') d.time = el.dataset.v; else d.project = el.dataset.v; } CH.extra = null; return renderChat(); }
       case 'chatdiscard': CH.drafts = []; CH.pick = new Set(); return renderChat();
       case 'draftdrop': CH.drafts.splice(+el.dataset.n, 1); return renderChat();
       case 'draftmerge': { const n = +el.dataset.n; const a = CH.drafts[n - 1], b = CH.drafts[n]; if (!a || !b) return; if (isLogD(a) || isLogD(b)) { if (!isLogD(a) || !isLogD(b)) return; a.title = `${a.title} ${t('andJoin2')} ${b.title}`.slice(0, 300); a.project = a.project || b.project; a.match = matchOpenTask(a.title); a.closeTask = undefined; CH.drafts.splice(n, 1); return renderChat(); } a.title = `${a.title} ${t('andJoin')} ${b.title}`.slice(0, 300); b.people.forEach(p => { if (!a.people.some(q => refName(q.ref) === refName(p.ref))) a.people.push(p); }); if (b.due && (!a.due || b.due < a.due)) a.due = b.due; if (b.priority === 'hi') a.priority = 'hi'; a.source = a.source || b.source; a.time = a.time || b.time; a.recur = a.recur || b.recur; if (a.role !== b.role) a.role = 'both'; CH.drafts.splice(n, 1); return renderChat(); }
-      case 'draftedit': { const d = CH.drafts[+el.dataset.n]; if (!d) return; if (isLogD(d)) return openLogForm(null, { draftId: d.id, title: d.title, date: d.date, project: d.project }); return openTaskForm(null, { draftId: d.id, title: d.title, due: d.due, time: d.time, recur: d.recur, noDue: d.noDue, priority: d.priority, role: d.role, source: d.source, project: d.project, who: d.people.filter(p => p.role !== 'related').map(p => refName(p.ref)) }); }
+      case 'draftedit': { const d = CH.drafts[+el.dataset.n]; if (!d) return; if (isLogD(d)) return openLogForm(null, { draftId: d.id, title: d.title, date: d.date, project: d.project }); return openTaskForm(null, { draftId: d.id, title: d.title, due: d.due, time: d.time, recur: d.recur, noDue: d.noDue, priority: d.priority, role: d.role, source: d.source, project: d.project, unit: d.unit || '', who: d.people.filter(p => p.role === 'followup').map(p => refName(p.ref)), extra: d.extra || null }); }
       case 'ansdue': { const pp = pending(); if (pp) { pp.d.due = el.dataset.v || null; pp.d.noDue = !el.dataset.v; pp.d.weekendOk = false; } return renderChat(); }
       case 'answk': { const pp = pending(); if (pp) { if (el.dataset.v === 'keep') pp.d.weekendOk = true; else pp.d.due = el.dataset.v; } return renderChat(); }
       case 'anssrc': { const pp = pending(), v = el.dataset.v; if (el.dataset.all) CH.drafts.forEach(x => { if (!isLogD(x) && !x.source) x.source = v; }); else if (pp) pp.d.source = v; CH.lastSrc = v; return renderChat(); }
@@ -2111,6 +2704,13 @@ document.addEventListener('click', async e => {
       case 'mic': return toggleMic();
       case 'aiundo': return undoAI(id);
       case 'harvest': return openHarvest();
+      case 'org': return openOrg();
+      case 'orgimport': case 'chatattach': return pickSheet();
+      case 'orgold': return toast(t('orgNeedsDb'), null, 'err', 6000);
+      case 'unitadd': return openUnitForm(null, el.dataset.parent || null);
+      case 'unitedit': { const u = unitById(el.dataset.u); return u && openUnitForm(u); }
+      case 'stmenu': return x && openStatusMenu(x);
+      case 'stpick': { if (!x) return; const v = el.dataset.v; closeSheet(true); if (v === 'done') return isOpen(x) && openComplete(x); if (v === 'wait' && !x.waiting_on) return openTaskForm(x, { status: 'wait' }); if (x.status !== v) { setStatus(x, v); toast(t('statusSet', { s: t(stKey(v)) })); } return; }
       case 'hm': { const n = shiftYM(UI.hym, +el.dataset.d); if (n > thisYM()) return; UI.hym = n; UI.layers.forEach(Lr => Lr.rerender()); return; }
       case 'present': return openPresent();
       case 'projreport': return openPresent(projectSnapshot(el.dataset.v));
@@ -2123,6 +2723,7 @@ document.addEventListener('click', async e => {
       case 'sharevia': { try { await navigator.share({ title: document.title, url: el.dataset.url }); } catch { } return; }
       case 'shares': return openShares();
       case 'revokeshare': return confirmSheet(t('revokeQ'), t('revoke'), async () => { const { error } = await sb.from('shares').update({ revoked: true }).eq('id', el.dataset.sid); if (error) return toast(t('shareFail'), null, 'err'); const it = (UI.sharesList || []).find(x => x.id === el.dataset.sid); if (it) it.revoked = true; UI.layers.forEach(Lr => Lr.rerender()); toast(t('revokedSt')); });
+      case 'askmore': { const st = Object.assign({}, state.profile.settings); st.askMore = !askMore(); saveProfile({ settings: st }); return renderMain(); }
       case 'asksrc': { const st = Object.assign({}, state.profile.settings); st.askSource = !askSource(); saveProfile({ settings: st }); return renderMain(); }
       case 'tour': return openTour(0);
       case 'xlsx': return exportXlsx();
@@ -2180,7 +2781,8 @@ document.addEventListener('input', e => {
   if (e.target.id === 'libQ') { UI.lq = e.target.value; clearTimeout(UI.lqt); UI.lqt = setTimeout(() => renderListOnly('library', '#libList'), 120); return; }
   if (e.target.id === 'taskQ') { UI.q = e.target.value; clearTimeout(UI.qt); UI.qt = setTimeout(() => renderListOnly('tasks', '#taskList'), 120); }
 });
-document.addEventListener('change', e => { if (/^tf(St|Person|Project|From|To)$/.test(e.target.id || '')) { const k = { tfSt: 'st', tfPerson: 'person', tfProject: 'project', tfFrom: 'from', tfTo: 'to' }[e.target.id]; UI.tf = Object.assign({}, UI.tf, { [k]: e.target.type === 'date' ? (validDate(e.target.value) || '') : e.target.value }); UI.keepScroll = true; return renderMain(); } if (e.target.id === 'ansTime' && /^\d{2}:\d{2}$/.test(e.target.value)) { const ex = extraOn(); if (ex) { CH.drafts[ex.n].time = e.target.value; CH.extra = null; } return renderChat(); } if (e.target.id === 'ansDate' && validDate(e.target.value)) { const pp = pending(); if (pp) { pp.d.due = e.target.value; pp.d.noDue = false; pp.d.weekendOk = isWeekend(e.target.value); } return renderChat(); } if (e.target.dataset?.hsel) { const ids = selOf(UI.hym); if (e.target.checked) ids.add(e.target.dataset.hsel); else ids.delete(e.target.dataset.hsel); return; } if (e.target.id === 'libMonth') { UI.lmonth = e.target.value; return renderMain(); } if (e.target.id === 'importFile' && e.target.files[0]) { importBackup(e.target.files[0]); e.target.value = ''; } });
+document.addEventListener('change', e => {
+  if (e.target.dataset?.pu) { const p = personById(e.target.dataset.pu); if (p) { p.unit_id = unitById(e.target.value) ? e.target.value : null; putPerson(p); toast(t('saved')); } return; } if (/^tf(St|Person|Project|Unit|From|To)$/.test(e.target.id || '')) { const k = { tfSt: 'st', tfPerson: 'person', tfProject: 'project', tfUnit: 'unit', tfFrom: 'from', tfTo: 'to' }[e.target.id]; UI.tf = Object.assign({}, UI.tf, { [k]: e.target.type === 'date' ? (validDate(e.target.value) || '') : e.target.value }); UI.keepScroll = true; return renderMain(); } if (e.target.id === 'ansTime' && /^\d{2}:\d{2}$/.test(e.target.value)) { const ex = extraOn(); if (ex) { CH.drafts[ex.n].time = e.target.value; CH.extra = null; } return renderChat(); } if (e.target.id === 'ansDate' && validDate(e.target.value)) { const pp = pending(); if (pp) { pp.d.due = e.target.value; pp.d.noDue = false; pp.d.weekendOk = isWeekend(e.target.value); } return renderChat(); } if (e.target.dataset?.hsel) { const ids = selOf(UI.hym); if (e.target.checked) ids.add(e.target.dataset.hsel); else ids.delete(e.target.dataset.hsel); return; } if (e.target.id === 'libMonth') { UI.lmonth = e.target.value; return renderMain(); } if (e.target.id === 'importFile' && e.target.files[0]) { importBackup(e.target.files[0]); e.target.value = ''; } });
 document.addEventListener('keydown', e => {
   const tgt = e.target;
   if ((e.key === 'Enter' || e.key === ' ') && tgt.matches?.('[role="button"][data-open]')) { e.preventDefault(); openTask(tgt.dataset.open); return; }

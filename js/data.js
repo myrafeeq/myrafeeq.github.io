@@ -27,7 +27,8 @@ export const state = {
   mode: null,            // 'cloud' | 'local' | null (signed out)
   user: null,            // { id, email, name }
   profile: { display_name: '', job_title: '', lang: 'ar', settings: {} },
-  tasks: [], people: [], files: [], rev: 0,
+  tasks: [], people: [], files: [], units: [], rev: 0,
+  schemaOld: false,      // cloud database not yet updated for 2.7.9 (no departments table): those features stay hidden
   sync: { status: 'idle', pending: 0, last: null, error: null, rejected: [] },
   drive: { linked: null, justLinked: false },   // null = unknown yet
 };
@@ -46,8 +47,9 @@ const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v ? JS
 const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } };
 const lsDel = k => { try { localStorage.removeItem(k); } catch { } };
 
-const TABLES = ['people', 'tasks', 'files'];
-const listOf = tbl => tbl === 'tasks' ? state.tasks : tbl === 'people' ? state.people : state.files;
+const TABLES = ['people', 'tasks', 'files', 'units'];
+const liveTables = () => state.schemaOld ? TABLES.filter(t => t !== 'units') : TABLES;
+const listOf = tbl => tbl === 'tasks' ? state.tasks : tbl === 'people' ? state.people : tbl === 'units' ? state.units : state.files;
 
 let outbox = new Set();
 let saveTimer = null;
@@ -55,7 +57,7 @@ function saveLocal() { state.rev++; if (saveTimer) return true; saveTimer = setT
 function saveLocalNow() {
   clearTimeout(saveTimer); saveTimer = null;
   if (!state.mode) return false; // signed out while a save was pending: never write an empty cache over the local-mode data
-  const ok = lsSet(K.cache(), { tasks: state.tasks, people: state.people, files: state.files, profile: state.profile });
+  const ok = lsSet(K.cache(), { tasks: state.tasks, people: state.people, files: state.files, units: state.units, profile: state.profile });
   if (ok) lsSet(K.outbox(), [...outbox]);  // never queue ids whose data could not be stored
   state.sync.pending = outbox.size;
   if (!ok) { state.sync.status = 'error'; state.sync.error = 'storage'; emit('sync'); }
@@ -68,7 +70,7 @@ let gen = 0;
 function loadLocal() {
   gen++;
   const c = lsGet(K.cache(), null);
-  state.tasks = c?.tasks || []; state.people = c?.people || []; state.files = c?.files || [];
+  state.tasks = c?.tasks || []; state.people = c?.people || []; state.files = c?.files || []; state.units = c?.units || [];
   if (c?.profile) state.profile = Object.assign({ display_name: '', job_title: '', lang: 'ar', settings: {} }, c.profile);
   outbox = new Set(lsGet(K.outbox(), []));
   state.sync.pending = outbox.size; state.sync.rejected = lsGet(K.rejected(), []); state.rev++;
@@ -107,6 +109,7 @@ async function enterCloud(session) {
   loadLocal();
   if (!state.profile.display_name && state.user.name) state.profile.display_name = state.user.name;
   state.drive.linked = lsGet('rafeeq2.drive.' + u.id, null);
+  state.schemaOld = !!lsGet('rafeeq2.schemaOld.' + u.id, null);
   emit('auth');
   if (!navigator.onLine) { setSync('offline'); return; }
   await captureDriveGrant(session);
@@ -128,7 +131,8 @@ export async function signOut({ wipe = true } = {}) {
   }
   if (wipe) { lsDel(K.cache()); lsDel(K.outbox()); lsDel(K.cursor()); }
   lsDel('rafeeq2.mode');
-  state.mode = null; state.user = null; state.tasks = []; state.people = []; state.files = []; outbox = new Set();
+  schemaChecked = false; state.schemaOld = false;
+  state.mode = null; state.user = null; state.tasks = []; state.people = []; state.files = []; state.units = []; outbox = new Set();
   state.drive = { linked: null, justLinked: false }; driveTok = null; state.sync = { status: 'idle', pending: 0, last: null, error: null, rejected: [] };
   emit('auth');
 }
@@ -284,14 +288,17 @@ async function pushProfile() {
 
 /* ---------- mutations ---------- */
 const COLS = {
-  tasks: ['id', 'kind', 'title', 'details', 'status', 'priority', 'role', 'due', 'due_time', 'remind_min', 'recur', 'project', 'source', 'waiting_on', 'waiting_what', 'notes', 'steps_done', 'steps_total', 'completed_on', 'result', 'archived', 'followups', 'log', 'ai', 'deleted', 'client_ts', 'created_at'],
-  people: ['id', 'name', 'org', 'contact', 'notes', 'deleted', 'client_ts', 'created_at'],
+  tasks: ['id', 'kind', 'title', 'details', 'status', 'priority', 'role', 'due', 'due_time', 'remind_min', 'recur', 'project', 'source', 'waiting_on', 'waiting_what', 'notes', 'steps_done', 'steps_total', 'completed_on', 'result', 'archived', 'followups', 'log', 'ai', 'deleted', 'client_ts', 'created_at', 'unit_id', 'ext_ref', 'progress'],
+  people: ['id', 'name', 'org', 'contact', 'notes', 'deleted', 'client_ts', 'created_at', 'unit_id'],
+  units: ['id', 'name', 'kind', 'parent_id', 'sort', 'deleted', 'client_ts', 'created_at'],
   files: ['id', 'drive_id', 'name', 'mime', 'size', 'task_id', 'person_id', 'note', 'deleted', 'client_ts', 'created_at'],
 };
 export function newTask(fields = {}) {
-  return Object.assign({ id: uuid(), kind: 'task', title: '', details: '', status: 'todo', priority: 'mid', role: 'exec', due: null, due_time: null, remind_min: null, recur: null, project: '', source: '', waiting_on: null, waiting_what: 'reply', notes: '', steps_done: 0, steps_total: 0, completed_on: null, result: '', archived: false, followups: [], log: [], ai: {}, deleted: false, client_ts: nowISO(), created_at: nowISO() }, fields);
+  return Object.assign({ id: uuid(), kind: 'task', title: '', details: '', status: 'todo', priority: 'mid', role: 'exec', due: null, due_time: null, remind_min: null, recur: null, project: '', source: '', waiting_on: null, waiting_what: 'reply', notes: '', steps_done: 0, steps_total: 0, completed_on: null, result: '', archived: false, followups: [], log: [], ai: {}, unit_id: null, ext_ref: '', progress: null, deleted: false, client_ts: nowISO(), created_at: nowISO() }, fields);
 }
-export function newPerson(name) { return { id: uuid(), name: name.trim().replace(/\s+/g, ' '), org: '', contact: '', notes: '', deleted: false, client_ts: nowISO(), created_at: nowISO() }; }
+export function newPerson(name) { return { id: uuid(), name: name.trim().replace(/\s+/g, ' '), org: '', contact: '', notes: '', unit_id: null, deleted: false, client_ts: nowISO(), created_at: nowISO() }; }
+export function newUnit(fields = {}) { return Object.assign({ id: uuid(), name: '', kind: 'dept', parent_id: null, sort: 0, deleted: false, client_ts: nowISO(), created_at: nowISO() }, fields); }
+const NEW_COLS = { tasks: ['unit_id', 'ext_ref', 'progress'], people: ['unit_id'] }; // added by 009_org.sql
 export function newFile(fields = {}) { return Object.assign({ id: uuid(), drive_id: '', name: '', mime: '', size: 0, task_id: null, person_id: null, note: '', deleted: false, client_ts: nowISO(), created_at: nowISO() }, fields); }
 
 function put(tbl, obj) {
@@ -304,6 +311,7 @@ function put(tbl, obj) {
 export const putTask = t => put('tasks', t);
 export const putPerson = p => put('people', p);
 export const putFile = f => put('files', f);
+export const putUnit = u => put('units', u);
 export function bulkReplace({ tasks, people, files, added }) {
   // used by import: only the imported rows become pending upload (re-pushing everything would overwrite edits made elsewhere)
   state.tasks = tasks; state.people = people; if (files) state.files = files;
@@ -327,19 +335,22 @@ async function flush() {
   const uid = state.user.id, g0 = gen;
   const keys = [...outbox];
   const snap = new Map();
-  const rows = { tasks: [], people: [], files: [] };
+  const rows = { tasks: [], people: [], files: [], units: [] };
   for (const k of keys) {
     const [tbl, id] = k.split(':');
     if (!COLS[tbl]) { outbox.delete(k); continue; }
+    if (tbl === 'units' && state.schemaOld) continue; // waits in the outbox until the database is updated
     const obj = listOf(tbl).find(x => x.id === id);
     if (!obj) { outbox.delete(k); continue; }
-    const base = tbl === 'tasks' ? newTask() : tbl === 'people' ? newPerson('-') : newFile();
-    const row = {}; COLS[tbl].forEach(c => { row[c] = obj[c] !== undefined ? obj[c] : base[c]; }); if (tbl === 'tasks') row.kind = obj.kind === 'log' ? 'log' : 'task';
+    const base = tbl === 'tasks' ? newTask() : tbl === 'people' ? newPerson('-') : tbl === 'units' ? newUnit() : newFile();
+    const row = {}; COLS[tbl].forEach(c => { if (state.schemaOld && (NEW_COLS[tbl] || []).includes(c)) return; row[c] = obj[c] !== undefined ? obj[c] : base[c]; });
+    if (tbl === 'tasks' && state.schemaOld && row.status === 'review') row.status = 'wait'; // the old database knows no «review»; the device keeps it
+    if (tbl === 'units') row.name = String(row.name || '-').slice(0, 200); if (tbl === 'tasks') row.kind = obj.kind === 'log' ? 'log' : 'task';
     if (tbl === 'people') row.name = String(row.name || '-').slice(0, 200); if (tbl === 'files') row.name = String(row.name || '').slice(0, 300); if (tbl === 'tasks') row.title = String(row.title || '-').slice(0, 500);
     rows[tbl].push(row); snap.set(k, obj.client_ts);
   }
   try {
-    for (const tbl of TABLES) {
+    for (const tbl of liveTables()) {
       for (let i = 0; i < rows[tbl].length; i += 200) {
         const batch = rows[tbl].slice(i, i + 200);
         const { error } = await sb.from(tbl).upsert(batch, { onConflict: 'id' });
@@ -363,8 +374,9 @@ async function flush() {
       if (!obj || obj.client_ts === ts) outbox.delete(k); // changed again while in flight → keep queued
     }
     saveLocal(); backoff = 2000; state.sync.last = nowISO();
-    setSync(outbox.size ? 'syncing' : 'ok');
-    if (outbox.size) scheduleFlush(300);
+    const held = state.schemaOld ? [...outbox].filter(k => k.startsWith('units:')).length : 0; // departments wait for the database update
+    setSync(outbox.size - held ? 'syncing' : 'ok');
+    if (outbox.size - held) scheduleFlush(300);
   } catch (e) {
     const msg = e?.message || String(e);
     if (/JWT|auth|401|403/i.test(msg)) { try { await sb.auth.refreshSession(); } catch { } }
@@ -377,11 +389,12 @@ async function pull() {
   const uid = state.user.id, g0 = gen;
   const since = lsGet(K.cursor(), '1970-01-01T00:00:00Z');
   let maxTs = since, changed = false;
-  for (const tbl of TABLES) {
+  for (const tbl of liveTables()) {
     let from = 0;
     for (;;) {
       const { data, error } = await sb.from(tbl).select('*').gt('updated_at', since).order('updated_at', { ascending: true }).order('id', { ascending: true }).range(from, from + 499);
       if (state.user?.id !== uid || gen !== g0) return; // another tab replaced the cache (or the account changed): drop this pull, the cursor stays put
+      if (error && tbl === 'units' && /PGRST20[45]|42P01|Could not find/i.test(String(error.code || '') + ' ' + String(error.message || ''))) { state.schemaOld = true; lsSet('rafeeq2.schemaOld.' + uid, 1); break; } // database not updated yet
       if (error) throw error;
       for (const r of data) {
         if (r.updated_at > maxTs) maxTs = r.updated_at;
@@ -393,6 +406,11 @@ async function pull() {
           outbox.delete(key);
         }
         if (i >= 0 && JSON.stringify(list[i]) === JSON.stringify(r)) continue; // re-pulled unchanged row (the cursor overlaps on purpose)
+        if (i >= 0 && state.schemaOld) { // the old database drops the 2.7.9 fields: keep this device's values
+          (NEW_COLS[tbl] || []).forEach(c => { if (!(c in r) && list[i][c] !== undefined) r[c] = list[i][c]; });
+          if (tbl === 'tasks' && list[i].status === 'review' && r.status === 'wait') r.status = 'review';
+          if (JSON.stringify(list[i]) === JSON.stringify(r)) continue;
+        }
         if (i >= 0) list[i] = r; else list.push(r);
         changed = true;
       }
@@ -405,10 +423,22 @@ async function pull() {
   if (changed) emit('data');
 }
 
+/** Is the cloud database updated for 2.7.9 (009_org.sql)? Checked once per session; the last answer is remembered for offline starts. */
+let schemaChecked = false;
+async function checkSchema() {
+  if (schemaChecked || !sb || state.mode !== 'cloud') return;
+  const key = 'rafeeq2.schemaOld.' + state.user.id;
+  try {
+    const { error } = await sb.from('units').select('id').limit(1);
+    if (!error) { state.schemaOld = false; schemaChecked = true; lsDel(key); }
+    else if (/PGRST20[45]|42P01|42703|does not exist|Could not find/i.test(String(error.code || '') + ' ' + String(error.message || ''))) { state.schemaOld = true; schemaChecked = true; lsSet(key, 1); }
+  } catch { }
+  emit('data');
+}
 export async function syncNow() {
   if (state.mode !== 'cloud') return;
   if (!navigator.onLine) { setSync('offline'); return; }
-  try { setSync('syncing'); await pull(); await flush(); setSync(outbox.size ? 'syncing' : 'ok'); state.sync.last = nowISO(); emit('sync'); }
+  try { setSync('syncing'); await checkSchema(); await pull(); await flush(); setSync(outbox.size ? 'syncing' : 'ok'); state.sync.last = nowISO(); emit('sync'); }
   catch (e) { setSync('error', e?.message || String(e)); }
 }
 window.addEventListener('online', () => syncNow());
