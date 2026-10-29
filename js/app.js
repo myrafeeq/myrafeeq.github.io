@@ -277,13 +277,31 @@ function go(tab) { UI.tab = tab; closeAllLayers(); renderNav(); renderMain(); wi
 /* ================= components ================= */
 function statusPill(x) {
   if (isLog(x)) return `<span class="pill log">${sic('check', 12)}${t('logPill')}</span>`;
+  if (isLate(x)) return `<span class="pill late">${t('stLate')}</span>`;
   const m = { todo: ['', 'stTodo'], prog: ['prog', 'stProg'], wait: ['wait', 'stWait'], review: ['review', 'stReview'], hold: ['', 'stHold'], done: ['done', 'stDone'], cancelled: ['', 'stCancelled'] }[x.status] || ['', 'stTodo'];
   return `<span class="pill ${m[0]}">${x.status === 'wait' ? sic('clock', 13) : ''}${t(m[1])}</span>`;
 }
 /** The status on a card, tappable: one tap opens the status choices. */
 function statusBtn(x) {
-  const m = { prog: 'prog', wait: 'wait', review: 'review' }[x.status] || '';
-  return `<button type="button" class="pill stbtn ${m}" data-act="stmenu" data-id="${x.id}" aria-label="${esc(t('changeStatusOf', { s: t(stKey(x.status)) }))}">${x.status === 'wait' ? sic('clock', 12) : ''}${t(stKey(x.status))}<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>`;
+  const late = isLate(x), m = late ? 'late' : { prog: 'prog', wait: 'wait', review: 'review' }[x.status] || '';
+  return `<button type="button" class="pill stbtn ${m}" data-act="stmenu" data-id="${x.id}" aria-label="${esc(t('changeStatusOf', { s: late ? t('stLate') : t(stKey(x.status)) }))}">${late ? t('stLate') : t(stKey(x.status))}<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2.6" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>`;
+}
+/** 2.7.10: the old «بانتظار» and «متوقفة» become «قيد التنفيذ»; whoever the task waited on becomes a follow-up. Once per account. */
+let stMigDone = false;
+function migrateStatuses() {
+  if (stMigDone || !state.mode || (state.profile.settings || {}).stMig) return; stMigDone = true;
+  let n = 0;
+  live().filter(x => x.status === 'wait' || x.status === 'hold').forEach(x => {
+    const prev = x.status;
+    if (prev === 'wait' && x.waiting_on && !(x.followups || []).some(f => f.person_id === x.waiting_on && f.status === 'open')) {
+      const due = x.due && x.due > T() ? x.due : addWorkdays(T(), 1);
+      x.followups = x.followups || []; x.followups.push({ id: uuid(), person_id: x.waiting_on, what: t('waitFor_' + (x.waiting_what || 'reply')), due, status: 'open', created_at: nowISO(), closed_on: null, log: [] });
+      if (x.role === 'exec') x.role = 'both';
+    }
+    x.status = 'prog'; x.waiting_on = null; addLog(x, 'status', '', { from: prev, to: 'prog' }); putTask(x); n++;
+  });
+  const st = Object.assign({}, state.profile.settings, { stMig: 1 }); saveProfile({ settings: st });
+  if (n) console.info('statuses migrated', n);
 }
 function openStatusMenu(x) {
   openSheet(t('changeStatus'), `<p class="note" dir="auto" style="margin-top:0">«${esc(x.title.slice(0, 80))}»</p>
@@ -302,7 +320,7 @@ function taskCard(x, opts = {}) {
   const done = !isOpen(x);
   // one line, two facts at most: when, and the single thing that matters most about it (details live in the task page)
   const when = done ? (x.completed_on ? `<span>${t('doneOn', { d: fmtShort(x.completed_on) })}</span>` : '')
-    : (x.due || x.due_time ? (isLate(x) ? `<span class="pill late">${lateTxt(x.due)}</span>` : `<span class="num">${x.due ? rel(x.due) : ''}${x.due_time ? `${x.due ? ' · ' : ''}${fmtTime(x.due_time)}` : ''}${x.recur ? ` ${sic('repeat', 12)}` : ''}</span>`) : '');
+    : (x.due || x.due_time ? (isLate(x) ? `<span class="num late-txt">${fmtShort(x.due)} · ${plural(diffDays(T(), x.due), 'days')}</span>` : `<span class="num">${x.due ? rel(x.due) : ''}${x.due_time ? `${x.due ? ' · ' : ''}${fmtTime(x.due_time)}` : ''}${x.recur ? ` ${sic('repeat', 12)}` : ''}</span>`) : '');
   const key = x.status === 'wait' && x.waiting_on ? `<span>${sic('clock', 13)} ${t('waitingFrom', { w: t('w_' + (x.waiting_what || 'reply')), p: esc(pname(x.waiting_on)) })}</span>`
     : x.priority === 'hi' && !done ? `<span class="pill hi">${t('prioHi')}</span>`
     : nf ? `<span>${sic('users', 13)} ${esc(pname(nf.person_id).split(' ').slice(0, 2).join(' '))}${openFus(x).length > 1 ? ` +${openFus(x).length - 1}` : ''}</span>`
@@ -382,7 +400,7 @@ const TCOLS = [
   { k: 'title', h: 'fTitle', key: true, w: 42, get: x => x.title },
   { k: 'due', h: 'fDue', key: true, w: 12, date: true, get: x => x.due || '' },
   { k: 'time', h: 'fTime', w: 9, get: x => x.due_time || '' },
-  { k: 'status', h: 'fStatus', key: true, w: 14, get: x => t(stKey(x.status)) + (isLate(x) ? ` · ${t('secLate')}` : ''), sort: x => (isLate(x) ? 0 : 1) + ({ wait: 1, review: 1.5, prog: 2, todo: 3, hold: 4, done: 5, cancelled: 6 }[x.status] || 9) / 10 },
+  { k: 'status', h: 'fStatus', key: true, w: 14, get: x => isLate(x) ? t('stLate') : t(stKey(x.status)), sort: x => (isLate(x) ? 0 : 1) + ({ wait: 1, review: 1.5, prog: 2, todo: 3, hold: 4, done: 5, cancelled: 6 }[x.status] || 9) / 10 },
   { k: 'unit', h: 'fUnit', key: true, w: 22, get: x => orgOn() ? unitLabel(x.unit_id) : '', on: () => orgOn() && depts().length > 0 },
   { k: 'prio', h: 'fPriority', key: true, w: 11, get: x => PRIO_L(x.priority), sort: x => ({ hi: 0, mid: 1, lo: 2 }[x.priority] ?? 1) },
   { k: 'role', h: 'fRole', w: 13, get: x => t('role_' + (x.role || 'exec')) },
@@ -767,6 +785,7 @@ const VIEWS = {
         <button type="button" data-act="tour"><span class="mi">${ic.info}</span><span class="grow">${t('tourAgain')}<small>${t('tourAgainHint')}</small></span></button>
       </div>
       ${state.mode === 'cloud' ? `<div class="menu"><button type="button" data-act="notifs"><span class="mi">${ic.bell}</span><span class="grow">${t('notifTitle')}<small>${notifSummary()}</small></span></button></div>` : ''}
+      ${state.mode === 'cloud' ? `<div class="menu"><button type="button" data-act="feedback"><span class="mi">${ic.info}</span><span class="grow">${t('fbTitle')}<small>${t('fbHint')}</small></span></button></div>` : ''}
       ${state.mode === 'cloud' ? `<div class="menu"><button type="button" data-act="shares"><span class="mi">${ic.link}</span><span class="grow">${t('sharesTitle')}<small>${t('sharesHint')}</small></span></button></div>` : ''}
       ${state.mode === 'cloud' ? `<div class="menu"><button type="button" data-act="aitoggle"><span class="mi">${ic.spark}</span><span class="grow">${t('aiSetting')}<small>${UI.aiBlocked === 'missing_key' ? t('aiNotReady') : UI.aiBlocked === 'quota' ? t('aiQuota') : t('aiSettingHint')}</small></span><span class="switch ${(p.settings || {}).ai !== false ? 'on' : ''}" aria-hidden="true"></span></button></div>` : ''}
       ${state.mode === 'cloud' ? `<div class="menu">${state.drive.linked === true
@@ -887,7 +906,7 @@ function logText(e) {
   }
 }
 const stKey = s => ({ todo: 'stTodo', prog: 'stProg', wait: 'stWait', review: 'stReview', hold: 'stHold', done: 'stDone', cancelled: 'stCancelled' }[s] || 'stTodo');
-const OPEN_ST = () => ['todo', 'prog', 'wait', ...(orgOn() ? ['review'] : []), 'hold'];
+const OPEN_ST = () => ['todo', 'prog', ...(orgOn() ? ['review'] : [])]; // 2.7.10: the portal's statuses (جديد، قيد التنفيذ، قيد المراجعة؛ «متأخرة» is computed from the due date)
 
 /* ================= sheets ================= */
 let sheetState = null;
@@ -1226,7 +1245,7 @@ function answerExtra({ n, k }, text) {
 /* ---------- the chat runs the whole app: departments, people, statuses, screens ----------
    A command is understood on the device when it is plain («ضيف إدارة X وتحتها قسم Y»), otherwise by the assistant.
    Anything that changes data is shown as a card first and runs only when the user approves it. */
-const ST_WORDS = [[/(قيد المراجعه|للمراجعه|تحت المراجعه|review)/, 'review'], [/(جاري|جاريه|قيد التنفيذ|شغال|بدات|بدأت|in progress)/, 'prog'], [/(متوقف|متوقفه|معلق|معلقه|اوقف|on hold)/, 'hold'], [/(لم تبدا|جديد|جديده|not started)/, 'todo'], [/(مكتمل|مكتمله|خلصت|خلصانه|منجز|منجزه|اتقفلت|done|complete)/, 'done'], [/(بانتظار|منتظر|مستني|waiting)/, 'wait']];
+const ST_WORDS = [[/(قيد المراجعه|للمراجعه|تحت المراجعه|review)/, 'review'], [/(جاري|جاريه|قيد التنفيذ|شغال|بدات|بدأت|in progress)/, 'prog'], [/(لم تبدا|جديد|جديده|not started)/, 'todo'], [/(مكتمل|مكتمله|خلصت|خلصانه|منجز|منجزه|اتقفلت|done|complete)/, 'done']];
 const stOfWords = n => { const h = ST_WORDS.find(([rx]) => rx.test(n)); return h ? h[1] : null; };
 /** Open tasks that best match a description (shared significant words), best first. */
 function findTasks(desc) {
@@ -1252,6 +1271,7 @@ function localCommand(text) {
     return [{ op: 'open', screen: k }];
   }
   if (/^(ارفع|استورد|حمل|ضيف|اضف)\s+(شيت|ملف|اكسل|excel)/.test(n)) return [{ op: 'open', screen: 'sheet' }];
+  if (state.mode === 'cloud' && /^(عايز|عاوز|ابغي|ابي|اريد)?\s*(ابلغ|ابلاغ|بلاغ|اشتكي|شكوي)\s*(عن|ب)?\s*(مشكله|عطل|خطا)?\s*$/.test(n)) return [{ op: 'open', screen: 'feedback' }];
   if (!orgOn()) return null;
   // «ضيف إدارة X (وتحتها|فيها) قسم Y، Z»
   if ((m = /^(?:ضيف|ضيفي|اضف|أضف|اضيف|انشئ|أنشئ|اعمل|سجل)\s+(?:لي\s+)?(?:اداره|إدارة|ادارة)\s+(.+?)(?:\s+(?:و\s*)?(?:تحتها|فيها|جواها|بها|وتحتها|وفيها|تتبعها|ويتبعها)\s+(?:الاقسام|الأقسام|اقسام|أقسام|قسم|قسمين)?\s*:?\s*(.+))?$/.exec(raw))) {
@@ -1286,7 +1306,7 @@ function planActions(list) {
     if (!orgOn() && a.op !== 'set_status') return;
     if (a.op === 'add_unit' && a.name) return out.push({ op: 'add_unit', kind: a.parent ? 'sec' : 'dept', name: cleanName(a.name).slice(0, 150), parent: a.parent ? cleanName(a.parent).slice(0, 150) : null });
     if (a.op === 'map_person' && a.person && a.unit) { const pid = matchPersonLoose(a.person); const uid = matchUnit(a.unit) || null; if (pid) out.push({ op: 'map_person', person: pid, unit: uid, unitName: uid ? null : cleanName(a.unit) }); return; }
-    if ((a.op === 'set_status' || a.op === 'set_unit') && a.task) { const cands = findTasks(a.task); if (!cands.length) return; const st = a.op === 'set_status' ? (['todo', 'prog', 'wait', 'review', 'hold', 'done'].includes(a.status) ? a.status : stOfWords(normAr(a.status || ''))) : null; if (a.op === 'set_status' && !st) return; const uid = a.op === 'set_unit' ? matchUnit(a.unit || '') : null; if (a.op === 'set_unit' && !uid) return; out.push({ op: a.op, status: st, unit: uid, cands: cands.map(x => x.id), task: cands.length === 1 ? cands[0].id : null }); }
+    if ((a.op === 'set_status' || a.op === 'set_unit') && a.task) { const cands = findTasks(a.task); if (!cands.length) return; const st = a.op === 'set_status' ? ({ wait: 'prog', hold: 'prog' }[a.status] || (['todo', 'prog', 'review', 'done'].includes(a.status) ? a.status : stOfWords(normAr(a.status || '')))) : null; if (a.op === 'set_status' && !st) return; const uid = a.op === 'set_unit' ? matchUnit(a.unit || '') : null; if (a.op === 'set_unit' && !uid) return; out.push({ op: a.op, status: st, unit: uid, cands: cands.map(x => x.id), task: cands.length === 1 ? cands[0].id : null }); }
   });
   return out;
 }
@@ -1327,6 +1347,7 @@ function runActions() {
 }
 function openScreen(k) {
   if (k === 'sheet') return pickSheet();
+  if (k === 'feedback') { closeSheet(true); return openFeedback(); }
   closeSheet(true);
   if (k === 'org') return openOrg(); if (k === 'harvest') return openHarvest(); if (k === 'notifs') return openNotifSheet();
   if (k === 'table') { UI.tview = 'table'; return go('tasks'); }
@@ -1492,14 +1513,13 @@ function saveDrafts() {
     const ex = d.extra || {};
     const x = newTask({ title: d.title.slice(0, 300) || t('untitled'), due: d.noDue && !d.recur ? null : d.due, due_time: d.time || null, recur: d.recur || null, priority: d.priority, role: d.role, source: d.source, project: d.project || '', details: ex.details || '', notes: ex.notes || '', steps_total: ex.steps_total || 0, remind_min: ex.remind_min ?? null });
     if (unitById(d.unit)) x.unit_id = d.unit;
-    if (ex.status && ex.status !== 'wait') x.status = ex.status;
-    if (ex.status === 'wait' && ex.waiting_on) { const wid = getOrCreatePerson(ex.waiting_on); if (wid) { x.status = 'wait'; x.waiting_on = wid; x.waiting_what = ex.waiting_what || 'reply'; } }
+    if (ex.status && OPEN_ST().includes(ex.status)) x.status = ex.status;
     addLog(x, 'created');
     const idOf = r => { if (r.kind === 'known') return r.id; const id = getOrCreatePerson(r.kind === 'new' ? r.name : r.label); const p = personById(id); if (p && r.desc && !p.org) { p.org = r.desc; putPerson(p); } return id; };
     for (const p of d.people) {
       if (p.role === 'related' && d.role === 'exec') continue;
       const pid = idOf(p.ref); if (!pid) continue;
-      if (p.role === 'waiting' && x.status !== 'wait') { x.status = 'wait'; x.waiting_on = pid; x.waiting_what = d.waitWhat || 'reply'; continue; }
+      if (p.role === 'waiting' && !p.what) p.what = t('waitFor_' + (d.waitWhat || 'reply')); // 2.7.10: no «بانتظار» status — waiting on someone is a follow-up with them
       if (x.followups.some(f => f.person_id === pid)) continue;
       const due = validDate(p.due) || (x.due && x.due > T() ? (diffDays(x.due, T()) > 1 ? addWorkdays(x.due, -1) : x.due) : addWorkdays(T(), 1));
       x.followups.push({ id: uuid(), person_id: pid, what: p.what || '', due, status: 'open', created_at: nowISO(), closed_on: null, log: [] });
@@ -1685,7 +1705,7 @@ function openTaskForm(x, pre = null) {
   const rc = v.recur || null, rcDom = rc && rc.dom !== 'last' && rc.dom ? rc.dom : pd(v.due || T()).getDate(), rcDays = rc?.days?.length ? rc.days : [pd(v.due || T()).getDay()];
   const projects = [...new Set(live().map(y => (y.project || '').trim()).filter(Boolean))];
   const srcOpts = [...new Set([...recentSources(), ...people().map(p => p.name)])];
-  const stOpts = OPEN_ST().concat(isNew ? [] : ['cancelled']);
+  const stOpts = OPEN_ST().concat(!isNew && !OPEN_ST().includes(v.status) && v.status !== 'done' ? [v.status] : []);
   const whoNames = pre?.who || (x ? [...new Set(openFus(x).map(f => pname(f.person_id)))] : []);
   const noDue0 = pre ? !!pre.noDue : (!isNew && !v.due);
   openSheet(isNew ? t('newTask') : t('editTask'), `<form id="taskForm" class="form" autocomplete="off" novalidate>
@@ -1994,6 +2014,43 @@ window.addEventListener('hashchange', routeHash);
 if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', e => { const id = e.data && e.data.openTask; if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return; if (taskById(id)) { closeAllLayers(); openTask(id); } else history.replaceState(null, '', location.pathname + location.search + '#t=' + id); });
 
 /* ---------- people ---------- */
+/* ---------- report a problem / suggestion (read by the support check) ---------- */
+function deviceInfo() {
+  const ua = navigator.userAgent || '';
+  const os = /iphone/i.test(ua) ? 'iPhone' : /ipad/i.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ? 'iPad' : /android/i.test(ua) ? 'Android' : /windows/i.test(ua) ? 'Windows' : /mac os/i.test(ua) ? 'Mac' : /linux/i.test(ua) ? 'Linux' : 'Other';
+  const osv = (ua.match(/(?:iPhone OS|CPU OS|Android|Windows NT|Mac OS X) ([\d._]+)/) || [])[1]?.replace(/_/g, '.') || '';
+  const br = /edg\//i.test(ua) ? 'Edge' : /samsungbrowser/i.test(ua) ? 'Samsung' : /crios|chrome/i.test(ua) ? 'Chrome' : /fxios|firefox/i.test(ua) ? 'Firefox' : /safari/i.test(ua) ? 'Safari' : 'Other';
+  const app = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone ? 'app' : 'browser';
+  return `${os} ${osv} · ${br} · ${app} · ${innerWidth}×${innerHeight}`.slice(0, 300);
+}
+function openFeedback() {
+  openSheet(t('fbTitle'), `<form id="fbForm" class="form" autocomplete="off">
+      <div class="seg2" id="fbKind"><button type="button" class="on" data-k="issue">${t('fbIssue')}</button><button type="button" data-k="idea">${t('fbIdea')}</button></div>
+      <label class="fld"><span>${t('fbWhat')}</span><textarea name="msg" rows="5" maxlength="2000" dir="auto" placeholder="${esc(t('fbPh'))}" autofocus></textarea></label>
+      <p class="note">${t('fbAuto', { d: esc(deviceInfo()), v: esc(window.RAFEEQ_VERSION || '') })}</p>
+      <p class="note err-txt" id="fbErr" hidden></p>
+      <div class="save-row"><button class="btn primary block" type="submit">${sic('send', 18)}${t('fbSend')}</button></div></form>`, {
+    onMount: sh => {
+      const f = sh.querySelector('#fbForm'); let kind = 'issue';
+      sh.querySelectorAll('#fbKind [data-k]').forEach(b => b.onclick = () => { kind = b.dataset.k; sh.querySelectorAll('#fbKind [data-k]').forEach(y => y.classList.toggle('on', y === b)); });
+      f.onsubmit = async e => {
+        e.preventDefault();
+        const msg = String(f.elements.msg.value || '').trim(); const err = sh.querySelector('#fbErr');
+        if (!msg) { f.elements.msg.focus(); return; }
+        if (!navigator.onLine) { err.textContent = t('fbOffline'); err.hidden = false; return; }
+        const btn = f.querySelector('[type=submit]'); btn.disabled = true;
+        const diag = { sync: state.sync.status, syncErr: String(state.sync.error || '').slice(0, 200), pending: state.sync.pending, rejected: (state.sync.rejected || []).length, ai: UI.aiBlocked || (aiOn() ? 'on' : 'off'), schemaOld: !!state.schemaOld, mic: SR ? (micKbd() ? 'keyboard' : 'web') : 'none', tasks: live().length, lang: L() };
+        try {
+          const { error } = await sb.from('feedback').insert({ kind, message: msg.slice(0, 2000), device: deviceInfo(), app_version: String(window.RAFEEQ_VERSION || '').slice(0, 20), diag });
+          if (error) throw error;
+          closeSheet(true); toast(t('fbThanks'));
+        } catch (ex) { console.warn('feedback', ex); err.textContent = /feedback|PGRST20[45]|42P01/i.test(String(ex?.message || '') + (ex?.code || '')) ? t('fbNotReady') : t('fbFailed'); err.hidden = false; btn.disabled = false; }
+      };
+    }
+  });
+  sheetState.guard = true;
+}
+
 /* ---------- departments & sections ---------- */
 function openOrg() {
   pushLayer(() => {
@@ -2099,7 +2156,7 @@ function cellDate(v) {
   return null;
 }
 const splitNames = v => String(v || '').split(/[,،;؛\n]+/).map(x => x.replace(/\s+/g, ' ').trim()).filter(Boolean);
-const PORTAL_ST = [[/(مكتمل|منجز|منتهي|مغلق|اغلق|تم|done|complete|closed)/, 'done'], [/(ملغ|cancel)/, 'cancelled'], [/(مراجع|review)/, 'review'], [/(قيد التنفيذ|جار|جاري|in progress|progress|doing)/, 'prog'], [/(معلق|متوقف|hold|paused)/, 'hold'], [/(انتظار|بانتظار|waiting)/, 'prog'], [/(جديد|لم تبدا|لم يبدا|new|todo|open|not started)/, 'todo']];
+const PORTAL_ST = [[/(مكتمل|منجز|منتهي|مغلق|اغلق|تم|done|complete|closed)/, 'done'], [/(ملغ|cancel)/, 'cancelled'], [/(مراجع|review)/, 'review'], [/(قيد التنفيذ|جار|جاري|in progress|progress|doing)/, 'prog'], [/(معلق|متوقف|hold|paused)/, 'prog'], [/(انتظار|بانتظار|waiting)/, 'prog'], [/(جديد|لم تبدا|لم يبدا|new|todo|open|not started)/, 'todo']];
 function portalStatus(v, pct) { const n = normAr(String(v || '')); if (/(متاخر|overdue|late)/.test(n)) return pct > 0 ? 'prog' : 'todo'; const hit = PORTAL_ST.find(([rx]) => rx.test(n)); return hit ? hit[1] : pct >= 100 ? 'review' : pct > 0 ? 'prog' : 'todo'; }
 function portalPrio(v) { const n = normAr(String(v || '')); return /(عاجل|حرج|urgent|critical)/.test(n) ? ['hi', true] : /(عالي|مرتفع|high)/.test(n) ? ['hi', false] : /(منخفض|low)/.test(n) ? ['lo', false] : ['mid', false]; }
 /** A person from a sheet: the exact contact, or one whose name is contained in it («مأمون الصقور» ⊂ «مامون محمود هزاع الصقور»). */
@@ -2722,6 +2779,7 @@ document.addEventListener('click', async e => {
       case 'copylink': return copyText(el.dataset.url);
       case 'sharevia': { try { await navigator.share({ title: document.title, url: el.dataset.url }); } catch { } return; }
       case 'shares': return openShares();
+      case 'feedback': return openFeedback();
       case 'revokeshare': return confirmSheet(t('revokeQ'), t('revoke'), async () => { const { error } = await sb.from('shares').update({ revoked: true }).eq('id', el.dataset.sid); if (error) return toast(t('shareFail'), null, 'err'); const it = (UI.sharesList || []).find(x => x.id === el.dataset.sid); if (it) it.revoked = true; UI.layers.forEach(Lr => Lr.rerender()); toast(t('revokedSt')); });
       case 'askmore': { const st = Object.assign({}, state.profile.settings); st.askMore = !askMore(); saveProfile({ settings: st }); return renderMain(); }
       case 'asksrc': { const st = Object.assign({}, state.profile.settings); st.askSource = !askSource(); saveProfile({ settings: st }); return renderMain(); }
@@ -2804,6 +2862,7 @@ onChange(why => {
     return;
   }
   if (!state.mode) return;
+  if ((why === 'sync' && state.sync.status === 'ok') || (why === 'data' && state.mode === 'local')) migrateStatuses();
   if (why === 'sync') { document.querySelectorAll('.nav-foot, .hdr-side').forEach(n => n.innerHTML = syncChip()); const sc = document.querySelector('.sync-card'); if (sc && UI.tab === 'more') renderMain(); return; }
   if (why === 'data') {
     if ($('#onbForm')) return; renderNav(); UI.keepScroll = true;
